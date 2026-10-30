@@ -1,4 +1,4 @@
-# Mac 多窗口点击器
+# Mac多窗口连点器 · MultiClick for macOS
 
 [![MIT License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
@@ -8,7 +8,7 @@
 
 ## 下载与安装
 
-从 [Releases](https://github.com/wanderingsoulsdc/macos-multi-window-autoclicker/releases/latest) 下载 DMG，打开后将 **Mac窗口点击器.app** 拖入 **Applications**。
+从 [Releases](https://github.com/wanderingsoulsdc/macos-multi-window-autoclicker/releases/latest) 下载 DMG，打开后将 **Mac多窗口连点器.app** 拖入 **Applications**。
 
 当前公开包采用临时签名，未经过 Apple Developer ID 签名或公证，macOS 可能阻止直接打开；请自行评估下载来源，也可以按下方说明从源码构建。该版本不包含自动更新。
 
@@ -68,7 +68,7 @@ swift test
 zsh scripts/build-app.sh
 ```
 
-生成的应用位于 `dist/Mac窗口点击器.app`，也可双击根目录的 `打开窗口点击器.command`。构建脚本优先使用本机已有 Apple Development 签名身份，没有证书时使用临时签名；可用 `MAC_CLICKER_SIGN_IDENTITY` 指定身份。
+生成的应用位于 `dist/Mac多窗口连点器.app`，也可双击根目录的 `打开Mac多窗口连点器.command`。构建脚本优先使用本机已有 Apple Development 签名身份，没有证书时使用临时签名；可用 `MAC_CLICKER_SIGN_IDENTITY` 指定身份。
 
 制作公开 DMG（只处理应用副本，保留本地应用签名）：
 

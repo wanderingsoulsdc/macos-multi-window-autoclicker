@@ -50,10 +50,10 @@ final class MenuBarControl: NSObject {
     var onStop: (() -> Void)?
     override init() {
         super.init()
-        item.button?.image = NSImage(systemSymbolName: "cursorarrow.click", accessibilityDescription: "窗口点击器")
-        item.button?.toolTip = "窗口点击器 · 关闭窗口后继续运行 · 右键菜单可退出"
+        item.button?.image = NSImage(systemSymbolName: "cursorarrow.click", accessibilityDescription: "Mac多窗口连点器")
+        item.button?.toolTip = "Mac多窗口连点器 · 关闭窗口后继续运行 · 右键菜单可退出"
         let menu = NSMenu()
-        for (title, selector) in [("打开窗口点击器", #selector(show)), ("全部暂停 / 继续", #selector(pause)), ("全部停止  ⌃⌘Esc", #selector(stop))] {
+        for (title, selector) in [("打开Mac多窗口连点器", #selector(show)), ("全部暂停 / 继续", #selector(pause)), ("全部停止  ⌃⌘Esc", #selector(stop))] {
             let menuItem = NSMenuItem(title: title, action: selector, keyEquivalent: "")
             menuItem.target = self; menu.addItem(menuItem)
         }

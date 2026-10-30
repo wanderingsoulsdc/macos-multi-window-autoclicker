@@ -46,7 +46,8 @@ struct MainView: View {
             Image(systemName: "cursorarrow.click").font(.title2).foregroundStyle(.tint)
                 .frame(width: 38, height: 38).background(.tint.opacity(0.1), in: RoundedRectangle(cornerRadius: 10))
             VStack(alignment: .leading, spacing: 3) {
-                Text("窗口点击器").font(.system(size: 17, weight: .semibold))
+                Text("Mac多窗口连点器").font(.system(size: 17, weight: .semibold))
+                Text("MultiClick for macOS").font(.system(size: 10)).foregroundStyle(.secondary)
                 Text(model.saveLabel).font(.caption).foregroundStyle(.secondary)
             }
             Spacer()

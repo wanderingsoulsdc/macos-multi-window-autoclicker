@@ -23,7 +23,7 @@ struct ClickerApp: App {
         }
     }
     var body: some Scene {
-        Window("Mac 窗口点击器", id: "main") {
+        Window("Mac多窗口连点器", id: "main") {
             MainWindowContent(model: model, delegate: delegate)
         }
         .defaultSize(width: 1180, height: 790)

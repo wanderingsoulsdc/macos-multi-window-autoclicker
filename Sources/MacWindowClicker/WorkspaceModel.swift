@@ -235,11 +235,11 @@ final class WorkspaceModel: ObservableObject {
         _ = AXIsProcessTrustedWithOptions([key: true] as CFDictionary)
         if AXIsProcessTrusted() && !CGPreflightPostEventAccess() { _ = CGRequestPostEventAccess() }
         refreshPermissions()
-        message = "请在系统设置中为“Mac 窗口点击器”开启辅助功能权限。若已开启但仍提示未生效，请退出并重新打开本应用。"
+        message = "请在系统设置中为“Mac多窗口连点器”开启辅助功能权限。若已开启但仍提示未生效，请退出并重新打开本应用。"
     }
     func start() {
         NSApp.keyWindow?.makeFirstResponder(nil)
-        guard hotkeys.stopAvailable else { message = "紧急停止快捷键注册失败，可能被其他软件占用。请退出冲突软件后重新打开窗口点击器。"; return }
+        guard hotkeys.stopAvailable else { message = "紧急停止快捷键注册失败，可能被其他软件占用。请退出冲突软件后重新打开Mac多窗口连点器。"; return }
         engine.start(plan: plan, target: plan.windowCoordinates ? target : nil)
     }
     func testSelectedPoint() {

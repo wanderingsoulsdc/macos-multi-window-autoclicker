@@ -153,7 +153,7 @@ final class Controller: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         window = NSWindow(contentRect: NSRect(x: 590, y: 180, width: 620, height: 470),
                           styleMask: [.titled, .closable, .miniaturizable], backing: .buffered, defer: false)
-        window.title = "Mac 窗口点击器 · 可行性验证"
+        window.title = "Mac多窗口连点器 · 可行性验证"
         window.isReleasedWhenClosed = false
         let content = window.contentView!
         let title = NSTextField(labelWithString: "验证后台点击是否收到、鼠标是否移动、焦点是否改变")
