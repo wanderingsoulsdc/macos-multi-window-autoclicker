@@ -1,0 +1,23 @@
+Validation/build/
+Validation/results/
+.DS_Store
+.build/
+.swiftpm/
+dist/
+
+# Local history / user-specific validation notes (kept locally)
+docs/*
+!docs/compatibility.md
+!docs/testing.md
+
+# Credentials, signing material and local settings
+.env
+.env.*
+*.p12
+*.pfx
+*.key
+*.mobileprovision
+*.provisionprofile
+*.dSYM/
+*.xcuserstate
+xcuserdata/
