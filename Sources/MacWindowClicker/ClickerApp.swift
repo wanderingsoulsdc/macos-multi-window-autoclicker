@@ -35,7 +35,7 @@ struct ClickerApp: App {
                 Button("导出方案…") { model.exportPlan() }.keyboardShortcut("s", modifiers: [.command, .shift])
             }
             CommandMenu("运行") {
-                Button("开始") { model.start() }.disabled(model.engine.state.busy)
+                Button("启动当前方案") { model.start() }.disabled(model.engine.state.busy)
                 Button("全部暂停 / 继续  ⌃⌘P") { model.togglePauseAll() }
                 Button("全部停止  ⌃⌘Esc") { model.stopAll() }
             }

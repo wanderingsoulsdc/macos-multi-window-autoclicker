@@ -4,11 +4,12 @@ import ApplicationServices
 import ClickerCore
 
 enum RunState: Equatable {
-    case idle, waiting, countdown, running, paused, stopping, finished, stopped, failed
-    var busy: Bool { [.waiting, .countdown, .running, .paused, .stopping].contains(self) }
+    case idle, scheduled, waiting, countdown, running, paused, stopping, finished, stopped, failed
+    var busy: Bool { [.scheduled, .waiting, .countdown, .running, .paused, .stopping].contains(self) }
     var title: String {
         switch self {
         case .idle: return "准备就绪"
+        case .scheduled: return "等待定时启动"
         case .waiting: return "等待前台任务"
         case .countdown: return "即将开始"
         case .running: return "正在点击"
@@ -36,6 +37,7 @@ final class RunEngine: ObservableObject {
     @Published private(set) var currentPoint: UUID?
     @Published private(set) var detail = "添加点击点，然后开始。"
     @Published private(set) var countdown: Double = 0
+    @Published private(set) var scheduledDate: Date?
     @Published private(set) var logs: [RunLog] = []
     private var task: Task<Void, Never>?
     private let emitter = ClickEmitter()
@@ -49,31 +51,56 @@ final class RunEngine: ObservableObject {
 
     func start(plan: ClickPlan, target: WindowTarget?) {
         guard !state.busy else { return }
+        let timing: LaunchTiming
         do {
             try plan.validateForRun()
+            timing = try plan.launchTiming()
             guard plan.windowCoordinates == (target != nil) else { throw PlanError.message("请先选择当前要点击的窗口。") }
             if plan.mode != .foreground && !emitter.backgroundAvailable { throw PlanError.message("本系统未提供后台窗口接口，请手动选择其他模式。") }
             guard AXIsProcessTrusted(), CGPreflightPostEventAccess() else { throw PlanError.message("请先开启辅助功能权限；如果刚授权，请退出并重新打开本应用。") }
             for point in plan.activePoints { _ = try resolve(point: point, target: target, initialSize: target?.frame.size) }
         } catch { state = .failed; detail = error.localizedDescription; note(detail); return }
         sent = 0; total = plan.totalClicks; currentRound = 0; currentPoint = nil
-        countdown = plan.startDelay; state = plan.mode == .foreground ? .waiting : (plan.startDelay > 0 ? .countdown : .running)
-        detail = plan.startDelay > 0 ? "请准备好目标窗口。" : "正在开始。"
-        note("开始：\(plan.mode.title)，\(plan.repeatForever ? "持续循环" : "\(plan.rounds) 轮")。")
+        let delay: TimeInterval
+        switch timing {
+        case .after(let seconds):
+            delay = seconds
+            countdown = plan.mode == .foreground ? 0 : seconds
+            state = plan.mode == .foreground ? .waiting : (seconds > 0 ? .countdown : .running)
+            detail = seconds > 0 ? "请准备好目标窗口。" : "正在开始。"
+        case .at(let date):
+            delay = 0
+            scheduledDate = date
+            state = .scheduled
+            detail = "预约开始时间：\(date.formatted(date: .abbreviated, time: .standard))"
+            note(detail)
+        }
         task = Task { @MainActor [weak self] in
             guard let self = self else { return }
             let reservation = UUID()
             defer { if plan.mode == .foreground { ForegroundQueue.shared.release(reservation) } }
             do {
+                try await self.checkpoint()
+                if case .at(let date) = timing {
+                    try await self.wait(until: date)
+                    self.scheduledDate = nil
+                    for point in plan.activePoints {
+                        _ = try self.resolve(point: point, target: target, initialSize: target?.frame.size)
+                    }
+                }
                 if plan.mode == .foreground {
-                    self.detail = "前台任务按顺序执行，轮到后开始倒计时。"
+                    self.state = .waiting
+                    self.detail = "等待前台点击队列。"
                     try await ForegroundQueue.shared.acquire(reservation)
                     try await self.checkpoint()
-                    self.state = plan.startDelay > 0 ? .countdown : .running
+                    self.countdown = delay
+                    self.state = delay > 0 ? .countdown : .running
                     self.detail = "已轮到此任务，请将目标窗口置于前台。"
                 }
-                try await self.wait(plan.startDelay, isCountdown: true)
+                try await self.wait(delay, isCountdown: true)
+                self.countdown = 0
                 self.state = .running
+                self.note("开始：\(plan.mode.title)，\(plan.repeatForever ? "持续循环" : "\(plan.rounds) 轮")。")
                 var round = 1
                 while plan.repeatForever || round <= plan.rounds {
                     self.currentRound = round
@@ -101,17 +128,22 @@ final class RunEngine: ObservableObject {
                 self.detail = "已发送 \(self.sent) 次，尚未确认窗口是否响应。无反应时请手动更换点击方式。"
                 self.note(self.detail)
             } catch is CancellationError {
-                self.state = .stopped; self.detail = "已停止，共发送 \(self.sent) 次点击。"; self.note(self.detail)
+                self.state = .stopped
+                self.detail = self.scheduledDate != nil ? "已取消预约。" : "已停止，共发送 \(self.sent) 次点击。"
+                self.note(self.detail)
             } catch {
                 self.state = .failed; self.detail = error.localizedDescription; self.note(self.detail)
             }
-            self.currentPoint = nil; self.task = nil
+            self.currentPoint = nil
+            self.countdown = 0
+            self.scheduledDate = nil
+            self.task = nil
         }
     }
 
     func togglePause() {
         if state == .paused { state = resumeState; note("继续运行。") }
-        else if state == .running || state == .countdown || state == .waiting { resumeState = state; state = .paused; note("已暂停。") }
+        else if state == .running || state == .countdown || state == .waiting || state == .scheduled { resumeState = state; state = .paused; note("已暂停。") }
     }
     func stop() {
         guard state.busy else { return }
@@ -124,6 +156,14 @@ final class RunEngine: ObservableObject {
         while state == .paused { try await Task.sleep(nanoseconds: 50_000_000) }
         try Task.checkCancellation()
     }
+    private func wait(until date: Date) async throws {
+        while true {
+            try await checkpoint()
+            let remaining = date.timeIntervalSinceNow
+            if remaining <= 0 { return }
+            try await Task.sleep(for: .seconds(min(1, remaining)))
+        }
+    }
     private func wait(_ seconds: Double, isCountdown: Bool = false) async throws {
         var remaining = seconds
         while remaining > 0 {
@@ -131,7 +171,7 @@ final class RunEngine: ObservableObject {
             let start = ProcessInfo.processInfo.systemUptime
             try await Task.sleep(nanoseconds: UInt64(min(0.05, remaining) * 1_000_000_000))
             if state != .paused { remaining -= ProcessInfo.processInfo.systemUptime - start }
-            if isCountdown { countdown = max(0, remaining) }
+            if isCountdown && ceil(countdown) != ceil(remaining) { countdown = max(0, remaining) }
         }
         try await checkpoint()
     }

@@ -38,6 +38,19 @@ public struct TargetHint: Codable, Equatable {
     }
 }
 
+public enum StartMode: String, Codable, CaseIterable, Identifiable {
+    case immediate, countdown, scheduled
+
+    public var id: String { rawValue }
+    public var title: String {
+        switch self {
+        case .immediate: return "立即启动"
+        case .countdown: return "倒计时启动"
+        case .scheduled: return "指定时间启动"
+        }
+    }
+}
+
 public struct ClickPlan: Codable, Equatable {
     public var version = 1
     public var name = "我的点击方案"
@@ -48,7 +61,14 @@ public struct ClickPlan: Codable, Equatable {
     public var rounds = 1
     public var repeatForever = false
     public var startDelay: Double = 3
+    // Optional so existing workspace and exported plans still decode.
+    public var startModeOverride: StartMode?
+    public var scheduledStart: Date?
     public init() {}
+    public var startMode: StartMode {
+        get { startModeOverride ?? (startDelay == 0 ? .immediate : .countdown) }
+        set { startModeOverride = newValue }
+    }
     public var activePoints: [ClickPoint] { points.filter(\.enabled) }
     public var clicksPerRound: Int {
         activePoints.reduce(0) { partial, point in
@@ -66,8 +86,8 @@ public struct ClickPlan: Codable, Equatable {
         guard version == 1 else { throw PlanError.message("这个方案的文件版本暂不支持。") }
         guard points.count <= 500 else { throw PlanError.message("一个方案最多包含 500 个点击点。") }
         guard Set(points.map(\.id)).count == points.count else { throw PlanError.message("方案中有重复的点击点标识。") }
-        guard (1...999_999).contains(rounds), startDelay.isFinite, (0...60).contains(startDelay) else {
-            throw PlanError.message("轮数应为 1～999999，开始倒计时应为 0～60 秒。")
+        guard (1...999_999).contains(rounds), startDelay.isFinite, (0...86_400).contains(startDelay) else {
+            throw PlanError.message("轮数应为 1～999999，倒计时应为 0～86400 秒。")
         }
         for (index, point) in points.enumerated() {
             guard point.x.isFinite, point.y.isFinite, abs(point.x) <= 1_000_000, abs(point.y) <= 1_000_000 else {
@@ -86,6 +106,25 @@ public struct ClickPlan: Codable, Equatable {
         try validate()
         guard !activePoints.isEmpty else { throw PlanError.message("请先添加并启用至少一个点击点。") }
     }
+
+    public func launchTiming(now: Date = .now) throws -> LaunchTiming {
+        switch startMode {
+        case .immediate:
+            return .after(0)
+        case .countdown:
+            return .after(startDelay)
+        case .scheduled:
+            guard let scheduledStart, scheduledStart.timeIntervalSinceReferenceDate.isFinite, scheduledStart > now else {
+                throw PlanError.message("请选择一个还没到的启动时间。")
+            }
+            return .at(scheduledStart)
+        }
+    }
+}
+
+public enum LaunchTiming: Equatable {
+    case after(TimeInterval)
+    case at(Date)
 }
 
 public enum PlanError: LocalizedError {

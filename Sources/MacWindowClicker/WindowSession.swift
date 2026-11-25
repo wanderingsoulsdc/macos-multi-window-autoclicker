@@ -20,6 +20,9 @@ final class WindowSession: ObservableObject, Identifiable {
         return plan.targetHint?.title.isEmpty == false ? plan.targetHint!.title : "待绑定窗口"
     }
     var subtitle: String {
+        if let date = engine.scheduledDate, engine.state == .scheduled {
+            return "预约 · \(date.formatted(date: .omitted, time: .standard))"
+        }
         if engine.state.busy { return "\(engine.state.title) · \(engine.sent)\(engine.total.map { "/\($0)" } ?? "")" }
         if plan.windowCoordinates && target == nil { return "请选择窗口重新绑定" }
         return engine.state == .idle ? "\(plan.points.count) 个点击点" : "\(engine.state.title) · \(engine.sent) 次"

@@ -3,6 +3,28 @@ import CoreGraphics
 @testable import ClickerCore
 
 final class ClickerCoreTests: XCTestCase {
+    func testLaunchTimingPreservesOlderCountdownsAndRejectsExpiredAppointments() throws {
+        let now = Date(timeIntervalSinceReferenceDate: 900_000_000)
+        var legacy = ClickPlan()
+        legacy.startDelay = 12
+        let encoded = try JSONEncoder().encode(legacy)
+        let restored = try JSONDecoder().decode(ClickPlan.self, from: encoded)
+        XCTAssertEqual(try restored.launchTiming(now: now), .after(12))
+
+        legacy.startMode = .immediate
+        XCTAssertEqual(try legacy.launchTiming(now: now), .after(0))
+        legacy.startMode = .scheduled
+        XCTAssertThrowsError(try legacy.launchTiming(now: now))
+        legacy.scheduledStart = now
+        XCTAssertThrowsError(try legacy.launchTiming(now: now))
+        XCTAssertNoThrow(try legacy.validate(), "Expired appointments remain editable after reopening.")
+
+        let future = now.addingTimeInterval(37)
+        legacy.scheduledStart = future
+        let saved = try JSONDecoder().decode(ClickPlan.self, from: JSONEncoder().encode(legacy))
+        XCTAssertEqual(try saved.launchTiming(now: now), .at(future))
+    }
+
     func testPortraitPreviewFitsWithoutCroppingAndMarkerRoundTrips() {
         let bounds = CGRect(x: 0, y: 0, width: 360, height: 720)
         for viewport in [CGSize(width: 620, height: 320), CGSize(width: 280, height: 550)] {
@@ -27,6 +49,21 @@ final class ClickerCoreTests: XCTestCase {
             XCTAssertEqual(t.logicalPoint(display).x, point.x, accuracy: 0.00001)
             XCTAssertEqual(t.logicalPoint(display).y, point.y, accuracy: 0.00001)
         }
+    }
+    func testPreviewDragConvertsZoomedTranslationAndClampsToTargetEdges() throws {
+        let bounds = CGRect(x: 0, y: 0, width: 360, height: 720)
+        for zoom in [0.25, 0.5, 1, 2, 4] {
+            let transform = CanvasTransform(bounds: bounds, viewport: CGSize(width: 420, height: 300), zoom: zoom)
+            let moved = try XCTUnwrap(transform.draggedPoint(from: CGPoint(x: 73, y: 118),
+                by: CGSize(width: 28 * zoom, height: -16 * zoom)))
+            XCTAssertEqual(moved, CGPoint(x: 101, y: 102))
+            XCTAssertEqual(transform.draggedPoint(from: moved, by: CGSize(width: 10000, height: 10000)), CGPoint(x: 359, y: 719))
+            XCTAssertEqual(transform.draggedPoint(from: moved, by: CGSize(width: -10000, height: -10000)), .zero)
+        }
+        let desktop = CanvasTransform(bounds: CGRect(x: -1000, y: -300, width: 1800, height: 1100),
+                                      viewport: CGSize(width: 400, height: 300), zoom: 0.5)
+        XCTAssertEqual(desktop.draggedPoint(from: CGPoint(x: -800, y: -150), by: CGSize(width: 25, height: -10)), CGPoint(x: -750, y: -170))
+        XCTAssertNil(desktop.draggedPoint(from: .zero, by: CGSize(width: CGFloat.nan, height: 0)))
     }
     func testWindowMovementFollowsButResizeStops() throws {
         let size = CGSize(width: 800, height: 600)

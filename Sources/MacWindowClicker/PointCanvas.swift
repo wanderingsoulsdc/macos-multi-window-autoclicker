@@ -43,20 +43,17 @@ struct PointCanvas: View {
                             })
                         ForEach(Array(model.plan.points.enumerated()), id: \.element.id) { index, point in
                             if frame.contains(point.position) {
-                                let location = transform.displayedPoint(point.position)
-                                Button { model.selectedPoint = point.id } label: {
-                                    Text("\(index + 1)").font(.system(size: 11, weight: .bold, design: .rounded))
-                                        .foregroundStyle(.white).frame(width: 25, height: 25)
-                                        .background(engine.currentPoint == point.id && engine.state.busy ? Color.orange : Color.accentColor, in: Circle())
-                                        .overlay(Circle().stroke(.white, lineWidth: model.selectedPoint == point.id ? 3 : 1.5))
-                                        .shadow(color: .black.opacity(0.18), radius: 3, y: 1)
-                                }.buttonStyle(.plain).opacity(point.enabled ? 1 : 0.35)
-                                    .position(location)
-                                    .help("\(point.name) · (\(Int(point.x)), \(Int(point.y)))")
+                                CanvasPointMarker(point: point, number: index + 1, transform: transform,
+                                                  selected: model.selectedPoint == point.id,
+                                                  running: engine.currentPoint == point.id && engine.state.busy,
+                                                  editable: model.canEdit,
+                                                  select: { model.selectedPoint = point.id },
+                                                  move: { model.repositionPoint(point.id, to: $0) })
                             }
                         }
                     }
                     .frame(width: transform.size.width, height: transform.size.height)
+                    .coordinateSpace(name: "pointCanvas")
                     .padding(12)
                     .frame(minWidth: geometry.size.width, minHeight: geometry.size.height, alignment: .center)
                 }
@@ -64,7 +61,7 @@ struct PointCanvas: View {
                 .onChange(of: geometry.size) { _, size in updateFit(size) }
                 .onChange(of: model.canvasFrame) { _, _ in updateFit(geometry.size) }
             }.clipped()
-            Text(model.preview == nil ? "位置示意图；对准实际按钮请用屏幕取点。" : "静态截图；可放大滚动查看，点击标记可选中。")
+            Text(model.preview == nil ? "位置示意图；长按标记可拖动，对准按钮请用屏幕取点。" : "静态截图；点击标记选中，长按拖动调整位置。")
                 .font(.system(size: 10)).foregroundStyle(.secondary).lineLimit(2)
         }
         .padding(12).frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -99,4 +96,76 @@ struct PointCanvas: View {
         }.frame(width: size.width, height: size.height)
             .overlay(Rectangle().stroke(.primary.opacity(0.1), lineWidth: 1).allowsHitTesting(false))
     }
+}
+
+
+private struct CanvasPointMarker: View {
+    let point: ClickPoint
+    let number: Int
+    let transform: CanvasTransform
+    let selected: Bool
+    let running: Bool
+    let editable: Bool
+    let select: () -> Void
+    let move: (CGPoint) -> Void
+    @GestureState private var interaction = MarkerInteraction()
+    private var position: CGPoint {
+        interaction.held ? (transform.draggedPoint(from: point.position, by: interaction.translation) ?? point.position) : point.position
+    }
+    private var drag: some Gesture {
+        LongPressGesture(minimumDuration: 0.35, maximumDistance: 8)
+            .sequenced(before: DragGesture(minimumDistance: 0, coordinateSpace: .named("pointCanvas")))
+            .updating($interaction) { value, state, _ in
+                switch value {
+                case .first(let held): state.held = held
+                case .second(let held, let drag):
+                    state.held = held
+                    state.translation = drag?.translation ?? .zero
+                }
+            }
+            .onChanged { value in
+                switch value {
+                case .first(true), .second(true, _): select()
+                default: break
+                }
+            }
+            .onEnded { value in
+                guard editable, case .second(true, let drag?) = value,
+                      let position = transform.draggedPoint(from: point.position, by: drag.translation) else { return }
+                move(position)
+            }
+    }
+    private var marker: some View {
+        Text(String(number)).font(.system(size: 11, weight: .bold, design: .rounded))
+            .foregroundStyle(.white).frame(width: 25, height: 25)
+            .background(running ? Color.orange : Color.accentColor, in: Circle())
+            .overlay(Circle().stroke(.white, lineWidth: selected || interaction.held ? 3 : 1.5))
+            .shadow(color: .black.opacity(interaction.held ? 0.3 : 0.18), radius: interaction.held ? 6 : 3, y: 1)
+            .scaleEffect(interaction.held ? 1.2 : 1)
+            .contentShape(Circle())
+            .opacity(point.enabled ? 1 : 0.35)
+    }
+    var body: some View {
+        let logical = position
+        let location = transform.displayedPoint(logical)
+        let coordinates = "X \(Int(logical.x))，Y \(Int(logical.y))"
+        let hint = editable ? "长按并拖动调整位置" : "运行期间不能调整位置"
+        return marker
+            .onTapGesture(perform: select)
+            .highPriorityGesture(drag, including: editable ? .all : .none)
+            .position(location)
+            .zIndex(interaction.held ? 1 : 0)
+            .help(point.name + " · " + coordinates + " · " + hint)
+            .accessibilityElement()
+            .accessibilityLabel(Text("点击点 \(number)"))
+            .accessibilityValue(Text(coordinates))
+            .accessibilityHint(Text(hint))
+            .accessibilityAddTraits(.isButton)
+            .accessibilityAction { select() }
+    }
+}
+
+private struct MarkerInteraction {
+    var held = false
+    var translation = CGSize.zero
 }

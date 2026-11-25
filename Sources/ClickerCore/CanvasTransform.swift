@@ -17,4 +17,17 @@ public struct CanvasTransform {
     public func logicalPoint(_ displayed: CGPoint) -> CGPoint {
         CGPoint(x: displayed.x / scale + bounds.minX, y: displayed.y / scale + bounds.minY)
     }
+    /// A preview drag uses display-point translation; persist rounded logical
+    /// coordinates and keep right/bottom edges strictly inside the target.
+    public func draggedPoint(from origin: CGPoint, by translation: CGSize) -> CGPoint? {
+        guard origin.x.isFinite, origin.y.isFinite,
+              translation.width.isFinite, translation.height.isFinite,
+              !bounds.isNull, !bounds.isInfinite, bounds.width > 0, bounds.height > 0 else { return nil }
+        let logical = CGPoint(x: origin.x + translation.width / scale,
+                              y: origin.y + translation.height / scale)
+        guard logical.x.isFinite, logical.y.isFinite else { return nil }
+        return CGPoint(x: min(max(logical.x.rounded(), bounds.minX), max(bounds.minX, floor(bounds.maxX.nextDown))),
+                       y: min(max(logical.y.rounded(), bounds.minY), max(bounds.minY, floor(bounds.maxY.nextDown))))
+    }
+
 }

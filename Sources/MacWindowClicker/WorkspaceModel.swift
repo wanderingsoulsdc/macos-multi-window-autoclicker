@@ -175,6 +175,13 @@ final class WorkspaceModel: ObservableObject {
         let point = ClickPoint(name: "点击点 \(plan.points.count + 1)", x: floor(p.x), y: floor(p.y))
         plan.points.append(point); selectedPoint = point.id
     }
+    func repositionPoint(_ id: UUID, to position: CGPoint) {
+        guard canEdit, position.x.isFinite, position.y.isFinite,
+              canvasFrame.contains(position), let index = plan.points.firstIndex(where: { $0.id == id }) else { return }
+        selectedPoint = id
+        plan.points[index].x = position.x
+        plan.points[index].y = position.y
+    }
     func removePoint(_ id: UUID) {
         guard canEdit else { return }
         plan.points.removeAll { $0.id == id }
@@ -249,6 +256,10 @@ final class WorkspaceModel: ObservableObject {
         var test = plan
         point.count = 1; point.enabled = true
         test.points = [point]; test.rounds = 1; test.repeatForever = false
+        if test.startMode == .scheduled {
+            test.startDelay = test.mode == .foreground ? 3 : 0
+            test.startMode = test.mode == .foreground ? .countdown : .immediate
+        }
         engine.start(plan: test, target: plan.windowCoordinates ? target : nil)
     }
     func importPlan() {

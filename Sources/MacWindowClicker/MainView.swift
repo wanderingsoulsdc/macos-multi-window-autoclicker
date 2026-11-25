@@ -84,7 +84,7 @@ struct MainView: View {
             }
             Divider().frame(height: 28)
             VStack(alignment: .trailing, spacing: 5) {
-                Text("\(model.busyCount) 个任务运行中").font(.system(size: 10)).foregroundStyle(.secondary)
+                Text("\(model.busyCount) 个任务待执行或运行中").font(.system(size: 10)).foregroundStyle(.secondary)
                 HStack(spacing: 10) {
                     Button(model.allPaused ? "全部继续" : "全部暂停") { model.togglePauseAll() }
                     Button("全部停止", role: .destructive) { model.stopAll() }
@@ -207,7 +207,7 @@ struct MainView: View {
             Label("带 Command 的点击可能触发多选或打开新标签，请确认目标软件的含义。", systemImage: "command")
                 .font(.system(size: 11)).foregroundStyle(.orange)
         case .foreground:
-            Label("前台任务依次执行；轮到后请在倒计时内将目标窗口置于前台。", systemImage: "cursorarrow")
+            Label("前台任务依次执行。开始点击时，目标窗口须在前台且无遮挡。", systemImage: "cursorarrow")
                 .font(.system(size: 11)).foregroundStyle(.orange)
         }
     }
@@ -275,12 +275,7 @@ struct MainView: View {
                         TextField("轮数", value: $model.plan.rounds, format: .number).frame(width: 76)
                             .disabled(model.plan.repeatForever)
                     }
-                    HStack {
-                        Text("开始前等待").font(.caption)
-                        Spacer()
-                        TextField("秒", value: $model.plan.startDelay, format: .number).frame(width: 56)
-                        Text("秒").font(.caption).foregroundStyle(.secondary)
-                    }
+                    launchSettings
                     Text("每一轮会按左侧顺序执行所有已启用的点。").font(.system(size: 10)).foregroundStyle(.secondary)
                 }.textFieldStyle(.roundedBorder).disabled(!model.canEdit)
                 Divider()
@@ -299,6 +294,46 @@ struct MainView: View {
                 }
             }.padding(18)
         }.background(Color(nsColor: .underPageBackgroundColor).opacity(0.3))
+    }
+
+    private var launchSettings: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Picker("启动方式", selection: Binding(get: { model.plan.startMode }, set: { mode in
+                if mode == .scheduled && (model.plan.scheduledStart ?? .distantPast) <= .now {
+                    model.plan.scheduledStart = suggestedStart
+                }
+                model.plan.startMode = mode
+            })) {
+                ForEach(StartMode.allCases) { mode in Text(mode.title).tag(mode) }
+            }.font(.caption)
+
+            switch model.plan.startMode {
+            case .immediate:
+                EmptyView()
+            case .countdown:
+                HStack {
+                    Text("倒计时").font(.caption)
+                    Spacer()
+                    TextField("倒计时秒数", value: $model.plan.startDelay, format: .number)
+                        .frame(width: 72)
+                    Text("秒").font(.caption).foregroundStyle(.secondary)
+                }
+                Text("可设为 0～86,400 秒。").font(.caption2).foregroundStyle(.secondary)
+            case .scheduled:
+                ScheduledDatePicker(selection: Binding(
+                    get: { model.plan.scheduledStart ?? suggestedStart },
+                    set: { date in model.plan.scheduledStart = Calendar.current.dateInterval(of: .second, for: date)?.start ?? date }
+                ))
+                    .fixedSize()
+                Text("按本机时间启动一次。预约期间请保持应用运行、Mac 唤醒。")
+                    .font(.caption2).foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private var suggestedStart: Date {
+        let next = Date.now.addingTimeInterval(300)
+        return Calendar.current.dateInterval(of: .minute, for: next)?.start ?? next
     }
 }
 
@@ -361,6 +396,18 @@ private struct PointInspector: View {
 private struct RunBar: View {
     @ObservedObject var model: WorkspaceModel
     @ObservedObject var engine: RunEngine
+    private var countdownText: String {
+        let seconds = Int(ceil(engine.countdown))
+        if seconds < 60 { return "\(seconds) 秒" }
+        return String(format: "%02d:%02d:%02d", seconds / 3600, seconds / 60 % 60, seconds % 60)
+    }
+    private var startTitle: String {
+        switch model.plan.startMode {
+        case .immediate: return "开始点击"
+        case .countdown: return "开始倒计时"
+        case .scheduled: return "预约启动"
+        }
+    }
     var body: some View {
         HStack(spacing: 16) {
             ZStack {
@@ -371,7 +418,7 @@ private struct RunBar: View {
             VStack(alignment: .leading, spacing: 4) {
                 HStack(spacing: 10) {
                     Text(engine.state.title).font(.system(size: 13, weight: .semibold))
-                    if engine.state == .countdown || (engine.state == .paused && engine.countdown > 0) { Text("\(Int(ceil(engine.countdown))) 秒").font(.caption.monospacedDigit()).foregroundStyle(.secondary) }
+                    if engine.state == .countdown || (engine.state == .paused && engine.countdown > 0) { Text(countdownText).font(.caption.monospacedDigit()).foregroundStyle(.secondary) }
                     Text("已发送 \(engine.sent)\(engine.total.map { " / \($0)" } ?? "") 次").font(.caption.monospacedDigit()).foregroundStyle(.secondary)
                 }
                 Text(engine.detail).font(.system(size: 11)).foregroundStyle(engine.state == .failed ? Color.red : .secondary).lineLimit(2)
@@ -380,9 +427,9 @@ private struct RunBar: View {
                 HStack(spacing: 9) {
                     if engine.state.busy {
                         Button(engine.state == .paused ? "继续" : "暂停", systemImage: engine.state == .paused ? "play.fill" : "pause.fill") { engine.togglePause() }.disabled(engine.state == .stopping)
-                        Button("停止", systemImage: "stop.fill", role: .destructive) { engine.stop() }
+                        Button(engine.scheduledDate == nil ? "停止" : "取消预约", systemImage: "stop.fill", role: .destructive) { engine.stop() }
                     } else {
-                        Button("开始点击", systemImage: "play.fill") { model.start() }.buttonStyle(.borderedProminent)
+                        Button(startTitle, systemImage: model.plan.startMode == .scheduled ? "clock" : "play.fill") { model.start() }.buttonStyle(.borderedProminent)
                             .disabled(model.plan.activePoints.isEmpty || (model.plan.windowCoordinates && model.target == nil))
                     }
                 }.controlSize(.large)
