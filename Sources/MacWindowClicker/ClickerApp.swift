@@ -2,6 +2,7 @@ import SwiftUI
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
+    private let notifications = RunNotifications.shared
     var workspace: WorkspaceModel?
     var showMainWindow: (() -> Void)?
     func applicationWillTerminate(_ notification: Notification) { workspace?.shutdown() }
@@ -37,7 +38,7 @@ struct ClickerApp: App {
             CommandMenu("运行") {
                 Button("启动当前方案") { model.start() }.disabled(model.engine.state.busy)
                 Button("全部暂停 / 继续  ⌃⌘P") { model.togglePauseAll() }
-                Button("全部停止  ⌃⌘Esc") { model.stopAll() }
+                Button("全部停止  ⌃⌘Esc") { model.stopAll(source: "运行菜单") }
             }
         }
     }

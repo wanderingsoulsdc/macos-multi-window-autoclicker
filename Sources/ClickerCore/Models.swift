@@ -249,6 +249,15 @@ public enum PlanError: LocalizedError {
     public var errorDescription: String? { if case let .message(text) = self { return text }; return nil }
 }
 
+public struct WindowSizeChanged: LocalizedError {
+    let initial: CGSize
+    let current: CGSize
+
+    public var errorDescription: String? {
+        "macOS 报告的窗口大小与原尺寸不一致（\(Int(initial.width))×\(Int(initial.height)) → \(Int(current.width))×\(Int(current.height))）。请刷新窗口列表并检查点击点。"
+    }
+}
+
 public enum Coordinates {
     public static func quartzPoint(fromAppKit point: CGPoint, mainDisplayHeight: CGFloat) -> CGPoint {
         CGPoint(x: point.x, y: mainDisplayHeight - point.y)
@@ -258,7 +267,7 @@ public enum Coordinates {
     }
     public static func windowPoint(_ local: CGPoint, frame: CGRect, initialSize: CGSize) throws -> CGPoint {
         guard abs(frame.width - initialSize.width) < 1, abs(frame.height - initialSize.height) < 1 else {
-            throw PlanError.message("目标窗口大小发生变化（\(Int(initialSize.width))×\(Int(initialSize.height)) → \(Int(frame.width))×\(Int(frame.height))），已停止。请刷新窗口列表并检查点击点后重新开始。")
+            throw WindowSizeChanged(initial: initialSize, current: frame.size)
         }
         guard contains(local, size: frame.size) else { throw PlanError.message("点击点已超出目标窗口，已停止。") }
         return CGPoint(x: frame.minX + local.x, y: frame.minY + local.y)

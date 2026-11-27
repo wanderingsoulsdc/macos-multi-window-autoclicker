@@ -4,10 +4,11 @@ cd -- "${0:A:h:h}"
 configuration="${1:-release}"
 swift build -c "$configuration"
 binary_dir="$(swift build -c "$configuration" --show-bin-path)"
-bundle="$PWD/dist/Mac多窗口连点器.app"
+bundle="${MAC_CLICKER_APP_BUNDLE:-$PWD/dist/Mac多窗口连点器.app}"
 mkdir -p "$bundle/Contents/MacOS" "$bundle/Contents/Resources" .build/Clicker.iconset
 cp "$binary_dir/MacWindowClicker" "$bundle/Contents/MacOS/.MacWindowClicker.new"
 mv -f "$bundle/Contents/MacOS/.MacWindowClicker.new" "$bundle/Contents/MacOS/MacWindowClicker"
+cp Resources/MultiClick-TaskEnd.wav "$bundle/Contents/Resources/"
 xcrun swift scripts/AppIcon.swift "$PWD/.build/Clicker.iconset"
 iconutil -c icns .build/Clicker.iconset -o "$bundle/Contents/Resources/AppIcon.icns"
 cat > "$bundle/Contents/Info.plist" <<'PLIST'
@@ -20,8 +21,8 @@ cat > "$bundle/Contents/Info.plist" <<'PLIST'
 <key>CFBundleExecutable</key><string>MacWindowClicker</string>
 <key>CFBundleIconFile</key><string>AppIcon</string>
 <key>CFBundlePackageType</key><string>APPL</string>
-<key>CFBundleShortVersionString</key><string>0.2.8</string>
-<key>CFBundleVersion</key><string>13</string>
+<key>CFBundleShortVersionString</key><string>0.2.12</string>
+<key>CFBundleVersion</key><string>17</string>
 <key>LSMinimumSystemVersion</key><string>14.0</string>
 <key>CFBundleDevelopmentRegion</key><string>en</string>
 <key>CFBundleLocalizations</key><array><string>en</string><string>zh-Hans</string></array>

@@ -57,11 +57,11 @@ final class WorkspaceModel: ObservableObject {
         observeSessions()
         saveSubscription = changes.debounce(for: .milliseconds(450), scheduler: RunLoop.main)
             .sink { [weak self] in self?.save() }
-        hotkeys.onStop = { [weak self] in self?.stopAll() }
+        hotkeys.onStop = { [weak self] in self?.stopAll(source: "全局停止快捷键") }
         hotkeys.onPause = { [weak self] in self?.togglePauseAll() }
         menuBar.onShow = { [weak self] in self?.onShowMainWindow?() }
         menuBar.onPause = { [weak self] in self?.togglePauseAll() }
-        menuBar.onStop = { [weak self] in self?.stopAll() }
+        menuBar.onStop = { [weak self] in self?.stopAll(source: "菜单栏停止") }
         refreshWindows()
     }
     private func observeSessions() {
@@ -95,7 +95,7 @@ final class WorkspaceModel: ObservableObject {
     private func closeSession(_ id: UUID) {
         guard let index = sessions.firstIndex(where: { $0.id == id }) else { return }
         if id == selectedSessionID { cancelDragPlacement() }
-        picker.cancel(); sessions[index].engine.shutdown()
+        picker.cancel(); sessions[index].engine.shutdown(reason: "关闭标签", reportEnd: true)
         sessions.remove(at: index)
         if sessions.isEmpty {
             let session = WindowSession(saved: SavedSession())
@@ -110,7 +110,10 @@ final class WorkspaceModel: ObservableObject {
             if (session.engine.state == .paused) == resume { session.engine.togglePause() }
         }
     }
-    func stopAll() { picker.cancel(); for session in sessions { session.engine.stop() } }
+    func stopAll(source: String = "全部停止") {
+        picker.cancel()
+        for session in sessions { session.engine.stop(source: source) }
+    }
 
     var filteredWindows: [WindowTarget] {
         query.isEmpty ? windows : windows.filter { ($0.owner + " " + $0.label).localizedCaseInsensitiveContains(query) }
@@ -367,5 +370,10 @@ final class WorkspaceModel: ObservableObject {
         do { try PlanStore(url: url).save(plan) }
         catch { message = "导出失败：" + error.localizedDescription }
     }
-    func shutdown() { picker.cancel(); for session in sessions { session.engine.shutdown() }; save() }
+    func shutdown() {
+        picker.cancel()
+        for session in sessions { session.engine.shutdown() }
+        RunHistory.flush()
+        save()
+    }
 }

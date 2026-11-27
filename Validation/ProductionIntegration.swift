@@ -24,6 +24,7 @@ final class IntegrationController: NSObject, NSApplicationDelegate {
     var secondProcess: Process?
     var process: Process?
     var checks: [[String: Any]] = []
+    var endings: [RunEnd] = []
     var observations: [String: Any] = [:]
     var window: NSWindow!
     var label: NSTextField!
@@ -34,6 +35,7 @@ final class IntegrationController: NSObject, NSApplicationDelegate {
         label = NSTextField(wrappingLabelWithString: "正在检查正式版的点击次数、顺序、暂停、停止、窗口移动和失效处理。只点击自有靶窗口。")
         label.frame = NSRect(x: 25, y: 35, width: 390, height: 110)
         window.contentView?.addSubview(label); window.orderFrontRegardless()
+        engine.onEnd = { [weak self] end in self?.endings.append(end) }
         Task { @MainActor in await run() }
     }
     func require(_ condition: Bool, _ text: String) throws {
@@ -70,6 +72,63 @@ final class IntegrationController: NSObject, NSApplicationDelegate {
     var actions: [String] { (json(targetURL)["events"] as? [[String: Any]] ?? []).compactMap { $0["control"] as? String } }
     var drags: [[String: Any]] { json(targetURL)["drags"] as? [[String: Any]] ?? [] }
     var lastEventType: UInt? { (json(targetURL)["rawEvents"] as? [[String: Any]])?.last?["type"] as? UInt }
+
+    func checkWindowAvailability(target: WindowTarget) async throws {
+        var plan = ClickPlan()
+        plan.windowCoordinates = true
+        plan.mode = .background
+        plan.startMode = .immediate
+        var step = try point("standardButton", target: target, count: 3)
+        step.interval = 0.18
+        plan.points = [step]
+
+        let before = actions.count
+        let firstEnd = endings.count
+        engine.start(plan: plan, target: target)
+        try await wait { engine.sent == 1 }
+        save(["action": "brieflyOffscreen"], to: commandURL)
+        try await wait { !engine.state.busy }
+        let state = json(targetURL)
+        let received = Array((state["events"] as? [[String: Any]] ?? []).dropFirst(before))
+        let hidden = state["offScreenAt"] as? Double ?? 0
+        let restored = state["restoredAt"] as? Double ?? 0
+        let times = received.compactMap { $0["time"] as? Double }
+        try require(engine.state == .finished && engine.sent == 3 && times.count == 3 && restored > hidden &&
+                    times.allSatisfy { $0 < hidden || $0 >= restored } &&
+                    engine.logs.contains { $0.message.contains("已再次确认原目标窗口") },
+                    "暂时离屏时不发送，原窗口恢复后继续，三次操作不重发")
+        try require(Array(endings.dropFirst(firstEnd)) == [RunEnd(title: "任务已完成", sent: 3)],
+                    "正常完成只报告一次结束通知，包含发送次数")
+
+        let beforeStop = actions.count
+        engine.start(plan: plan, target: target)
+        try await wait { engine.sent == 1 }
+        save(["action": "offscreen"], to: commandURL)
+        try await wait { engine.detail.contains("正在复查") }
+        engine.stop()
+        try await wait { !engine.state.busy }
+        save(["action": "restore"], to: commandURL)
+        try await wait { (try? WindowCatalog.resolve(target))?.frame.size == target.frame.size }
+        try require(engine.state == .stopped && engine.sent == 1 && actions.count == beforeStop + 1,
+                    "复查期间停止后，原窗口恢复也不会继续发送")
+        try require(Array(endings.dropFirst(firstEnd + 1)) == [RunEnd(title: "任务已停止", sent: 1, reason: "停止来源：停止按钮")],
+                    "手动停止只报告一次结束通知，包含停止来源")
+
+        let beforeMissing = actions.count
+        engine.start(plan: plan, target: target)
+        try await wait { engine.sent == 1 }
+        save(["action": "offscreen"], to: commandURL)
+        try await wait { !engine.state.busy }
+        let newLogs = engine.logs.prefix(3)
+        try require(engine.state == .failed && engine.sent == 1 && actions.count == beforeMissing + 1 &&
+                    ["当前屏幕", "找不到原目标窗口", "原尺寸"].contains(where: { engine.detail.contains($0) }) &&
+                    newLogs.contains { $0.message.contains("正在复查") },
+                    "持续离屏超过复查时限才停止，记录具体的窗口状态")
+        try require(Array(endings.dropFirst(firstEnd + 2)) == [RunEnd(title: "任务已中止", sent: 1, reason: engine.detail)],
+                    "异常中止只报告一次结束通知，包含具体原因")
+        save(["action": "restore"], to: commandURL)
+        try await wait { (try? WindowCatalog.resolve(target))?.frame.size == target.frame.size }
+    }
 
     func checkLoopGroups(target: WindowTarget) async throws {
         var plan = ClickPlan()
@@ -174,6 +233,7 @@ final class IntegrationController: NSObject, NSApplicationDelegate {
 
             try await checkDrags(target: target)
             try await checkLoopGroups(target: target)
+            try await checkWindowAvailability(target: target)
 
             let secondaryURL = resultDir.appendingPathComponent("secondary-target.json")
             try? FileManager.default.removeItem(at: secondaryURL)
@@ -242,7 +302,7 @@ final class IntegrationController: NSObject, NSApplicationDelegate {
             try await wait { engine.sent >= 1 }
             save(["action": "resize"], to: commandURL)
             try await wait { !engine.state.busy }
-            try require(engine.state == .failed && engine.detail.contains("大小"), "窗口尺寸改变会停止")
+            try require(engine.state == .failed && engine.sent == 1 && engine.detail.contains("大小"), "窗口尺寸持续改变会停止，变化后不发送")
 
             target = try await spawn()
             plan.points = [try point("standardButton", target: target)]
@@ -252,7 +312,8 @@ final class IntegrationController: NSObject, NSApplicationDelegate {
             try await wait { !engine.state.busy }
             // macOS can shrink a closing window before removing it from the list;
             // stopping on that size change is also the required safe outcome.
-            try require(engine.state == .failed && (engine.detail.contains("关闭") || engine.detail.contains("大小")), "窗口关闭或进入关闭动画后停止")
+            try require(engine.state == .failed && engine.sent == 1 &&
+                        ["关闭", "大小", "当前屏幕"].contains(where: { engine.detail.contains($0) }), "窗口关闭或进入关闭动画后停止")
             save(["status": "passed", "checks": checks, "observations": observations], to: reportURL)
             label.stringValue = "正式版核心集成测试全部通过。\n结果：Validation/results/production-integration.json"
         } catch {

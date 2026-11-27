@@ -181,17 +181,7 @@ struct MainView: View {
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             DisclosureGroup("运行记录 · \(engine.logs.count)") {
-                ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 5) {
-                        if engine.logs.isEmpty { Text("运行后显示记录。") }
-                        ForEach(engine.logs) { log in
-                            HStack(alignment: .top, spacing: 8) {
-                                Text(log.time, style: .time).foregroundStyle(.tertiary)
-                                Text(log.message).textSelection(.enabled)
-                            }
-                        }
-                    }.font(.system(size: 10)).frame(maxWidth: .infinity, alignment: .leading).padding(.top, 5)
-                }.frame(height: 90)
+                RunHistoryPanel(records: engine.logs)
             }.font(.caption).foregroundStyle(.secondary)
         }.padding(20)
     }
@@ -308,6 +298,7 @@ struct MainView: View {
                     launchSettings
                     Text("每轮依次执行所有已启用的步骤。").font(.system(size: 10)).foregroundStyle(.secondary)
                 }.textFieldStyle(.roundedBorder).disabled(!model.canEdit)
+                RunNotificationSettings(canRequest: model.busyCount == 0)
                 Divider()
                 VStack(alignment: .leading, spacing: 10) {
                     HStack {
@@ -364,6 +355,40 @@ struct MainView: View {
     private var suggestedStart: Date {
         let next = Date.now.addingTimeInterval(300)
         return Calendar.current.dateInterval(of: .minute, for: next)?.start ?? next
+    }
+}
+
+private struct RunNotificationSettings: View {
+    @ObservedObject private var notifications = RunNotifications.shared
+    let canRequest: Bool
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            switch notifications.access {
+            case .checking:
+                EmptyView()
+            case .notRequested:
+                Button("开启任务结束通知", systemImage: "bell") {
+                    Task { await notifications.requestAccess() }
+                }.disabled(!canRequest || notifications.requesting)
+            case .banner:
+                Label("任务结束通知已开启", systemImage: "bell.badge")
+            case .quiet:
+                Label("结束通知将显示在通知中心", systemImage: "bell")
+            case .disabled:
+                Label("请在「系统设置 → 通知」中允许本应用通知", systemImage: "bell.slash")
+            }
+            if notifications.canPreviewSound {
+                Button("试听提示音", systemImage: "speaker.wave.2") {
+                    notifications.playSoundPreview()
+                }
+            }
+        }
+        .font(.caption).foregroundStyle(.secondary)
+        .task { await notifications.refresh() }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            Task { await notifications.refresh() }
+        }
     }
 }
 

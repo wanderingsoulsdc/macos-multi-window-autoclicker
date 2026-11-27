@@ -10,9 +10,17 @@ final class WindowSession: ObservableObject, Identifiable {
     @Published var selectedPoint: UUID?
     @Published var preview: WindowPreview?
     @Published var capturing = false
-    let engine = RunEngine()
+    let engine: RunEngine
     init(saved: SavedSession) {
         id = saved.id; plan = saved.plan; selectedPoint = saved.plan.points.first?.id
+        let logURL = FileManager.default.urls(for: .libraryDirectory, in: .userDomainMask).first?
+            .appendingPathComponent("Logs/MacWindowClicker", isDirectory: true)
+            .appendingPathComponent(saved.id.uuidString + ".jsonl")
+        engine = RunEngine(history: logURL.map(RunHistory.init(url:)))
+        engine.onEnd = { [weak self] end in
+            guard let self else { return }
+            RunNotifications.shared.post(end, targetName: self.label, sessionID: self.id)
+        }
     }
     var label: String {
         guard plan.windowCoordinates else { return "整个屏幕" }

@@ -22,10 +22,10 @@ enum RunState: Equatable {
     }
 }
 
-struct RunLog: Identifiable {
-    let id = UUID()
-    let time = Date()
-    let message: String
+struct RunEnd: Equatable {
+    let title: String
+    let sent: Int
+    var reason: String? = nil
 }
 
 @MainActor
@@ -38,8 +38,13 @@ final class RunEngine: ObservableObject {
     @Published private(set) var detail = "添加步骤，然后开始。"
     @Published private(set) var countdown: Double = 0
     @Published private(set) var scheduledDate: Date?
-    @Published private(set) var logs: [RunLog] = []
+    @Published private(set) var logs: [RunRecord] = []
+    var onEnd: ((RunEnd) -> Void)?
+    private let history: RunHistory?
     private var task: Task<Void, Never>?
+    private var closingRun = false
+    private var lastStep: String?
+    private var stopSource: String?
     private let emitter = ClickEmitter()
     private static var windowQueues: [pid_t: ForegroundQueue] = [:]
     @Published private var dragging = false
@@ -47,9 +52,18 @@ final class RunEngine: ObservableObject {
     var backgroundAvailable: Bool { emitter.backgroundAvailable }
     var statusTitle: String { state == .paused && dragging ? "本次拖动结束后暂停" : state.title }
 
-    func note(_ message: String) {
-        logs.insert(RunLog(message: message), at: 0)
-        if logs.count > 100 { logs.removeLast(logs.count - 100) }
+    init(history: RunHistory? = nil) {
+        self.history = history
+        logs = history?.recent() ?? []
+        if let last = logs.first, !last.closesRun {
+            note("上次任务没有留下结束记录，重新打开后需要手动启动。", closesRun: true)
+        }
+    }
+
+    func note(_ message: String, closesRun: Bool = false) {
+        let record = RunRecord(message: message, closesRun: closesRun)
+        logs = [record] + logs.prefix(RunHistory.visibleLimit - 1)
+        history?.append(record)
     }
 
     func start(plan: ClickPlan, target: WindowTarget?) {
@@ -62,12 +76,19 @@ final class RunEngine: ObservableObject {
             if plan.mode != .foreground && !emitter.backgroundAvailable { throw PlanError.message("本系统未提供后台窗口接口，请手动选择其他模式。") }
             guard AXIsProcessTrusted(), CGPreflightPostEventAccess() else { throw PlanError.message("请先开启辅助功能权限；如果刚授权，请退出并重新打开本应用。") }
             for point in plan.activePoints { _ = try resolve(point: point, target: target, initialSize: target?.frame.size) }
-        } catch { state = .failed; detail = error.localizedDescription; note(detail); return }
+        } catch {
+            state = .failed; detail = error.localizedDescription
+            note("启动失败 · \(detail)", closesRun: true)
+            onEnd?(RunEnd(title: "任务未启动", sent: 0, reason: detail))
+            return
+        }
         let batches = plan.executionBlocks.compactMap { block -> (group: LoopGroup?, enabledIndices: [Int])? in
             let indices = block.indices.filter { plan.points[$0].enabled }
             return indices.isEmpty ? nil : (block.group, indices)
         }
         sent = 0; total = plan.totalClicks; currentRound = 0; currentPoint = nil
+        lastStep = nil; closingRun = false; stopSource = nil
+        note("任务已提交 · \(plan.startMode.title) · \(plan.mode.title(includesDrag: plan.includesDrag))")
         let delay: TimeInterval
         switch timing {
         case .after(let seconds):
@@ -125,13 +146,22 @@ final class RunEngine: ObservableObject {
                 }
                 self.state = .finished
                 self.detail = "已发送 \(self.sent) 次，请在目标软件中确认效果。"
-                self.note(self.detail)
+                self.note(self.detail, closesRun: true)
+                self.onEnd?(RunEnd(title: "任务已完成", sent: self.sent))
             } catch is CancellationError {
                 self.state = .stopped
-                self.detail = self.scheduledDate != nil ? "已取消预约。" : "已停止，已发送 \(self.sent) 次完整操作。"
-                self.note(self.detail)
+                let cancelledSchedule = self.scheduledDate != nil
+                self.detail = cancelledSchedule ? "已取消预约。" : "已停止，已发送 \(self.sent) 次完整操作。"
+                if !self.closingRun {
+                    self.note(self.detail, closesRun: true)
+                    self.onEnd?(RunEnd(title: cancelledSchedule ? "预约已取消" : "任务已停止", sent: self.sent,
+                                       reason: self.stopSource.map { "停止来源：\($0)" }))
+                }
             } catch {
-                self.state = .failed; self.detail = error.localizedDescription; self.note(self.detail)
+                self.state = .failed; self.detail = error.localizedDescription
+                let step = self.lastStep.map { "\($0) · " } ?? ""
+                self.note("运行已中止 · 已发送 \(self.sent) 次 · \(step)\(self.detail)", closesRun: true)
+                if !self.closingRun { self.onEnd?(RunEnd(title: "任务已中止", sent: self.sent, reason: self.detail)) }
             }
             self.currentPoint = nil
             self.countdown = 0
@@ -143,9 +173,10 @@ final class RunEngine: ObservableObject {
     private func executeStep(_ point: ClickPoint, target: WindowTarget?, mode: ClickMode, context: String) async throws {
         for repetition in 1...point.count {
             let stepDetail = "\(context) · \(repetition)/\(point.count)"
+            lastStep = stepDetail
             try await execute(point, target: target, mode: mode, stepDetail: stepDetail)
             if sent < Int.max { sent += 1 }
-            if repetition == point.count { note(stepDetail + "，已发送。") }
+            if repetition == point.count || repetition.isMultiple(of: 50) { note(stepDetail + "，已发送。") }
             try await wait(point.interval)
         }
     }
@@ -158,12 +189,23 @@ final class RunEngine: ObservableObject {
             note(dragging ? "当前拖动结束后暂停。" : "已暂停。")
         }
     }
-    func stop() {
-        guard state.busy else { return }
+    func stop(source: String = "停止按钮") {
+        guard state.busy, state != .stopping else { return }
+        stopSource = source
+        note("收到停止指令 · \(source)")
         state = .stopping
         task?.cancel()
     }
-    func shutdown() { stop(); emitter.releasePendingButton() }
+    func shutdown(reason: String = "退出程序", reportEnd: Bool = false) {
+        if state.busy, !closingRun {
+            closingRun = true
+            note("\(reason)，任务结束 · 已发送 \(sent) 次完整操作。", closesRun: true)
+            if reportEnd { onEnd?(RunEnd(title: "任务已停止", sent: sent, reason: reason)) }
+            state = .stopping
+            task?.cancel()
+        }
+        emitter.releasePendingButton()
+    }
     private func checkpoint() async throws {
         try Task.checkCancellation()
         while state == .paused { try await Task.sleep(nanoseconds: 50_000_000) }
@@ -189,52 +231,70 @@ final class RunEngine: ObservableObject {
         try await checkpoint()
     }
     private func execute(_ point: ClickPoint, target: WindowTarget?, mode: ClickMode, stepDetail: String) async throws {
-        // Two windows owned by one app share its mouse gesture handling. Complete
-        // the press and release before another task can send a gesture to that app.
+        let clock = ContinuousClock()
+        var retryUntil: ContinuousClock.Instant?
         while true {
             try await checkpoint()
-            let reservation = UUID()
-            let queue = target.map { window in
-                if let existing = Self.windowQueues[window.pid] { return existing }
-                let queue = ForegroundQueue()
-                Self.windowQueues[window.pid] = queue
-                return queue
-            }
-            try await queue?.acquire(reservation)
-            defer {
-                if let target, let queue {
-                    queue.release(reservation)
-                    if !queue.isOccupied { Self.windowQueues[target.pid] = nil }
+            do {
+                // Complete each mouse gesture before sending another one to this app.
+                let reservation = UUID()
+                let queue = target.map { window in
+                    if let existing = Self.windowQueues[window.pid] { return existing }
+                    let queue = ForegroundQueue()
+                    Self.windowQueues[window.pid] = queue
+                    return queue
                 }
-            }
-            if state == .paused { continue }
-            try Task.checkCancellation()
-
-            let resolved = try resolve(point: point, target: target, initialSize: target?.frame.size)
-            if mode == .foreground, let window = resolved.window {
-                try requireForeground(window, at: resolved.position)
-            }
-            currentPoint = point.id
-            detail = stepDetail
-            if let drag = point.drag, let end = resolved.end {
-                if mode == .foreground, let window = resolved.window { try requireForeground(window, at: end) }
-                dragging = true
-                defer { dragging = false }
-                try await emitter.drag(from: resolved.position, to: end, duration: drag.duration,
-                                       window: resolved.window, mode: mode) { position in
-                    if let window = resolved.window {
-                        guard WindowCatalog.isUnchangedDuringDrag(window) else {
-                            throw PlanError.message("拖动时目标窗口移动、改变大小或消失，已松开鼠标并停止。")
-                        }
-                        if mode == .foreground { try self.requireForeground(window, at: position) }
-                    } else if !Coordinates.isOnDisplay(position, displays: WindowCatalog.displayFrames) {
-                        throw PlanError.message("拖动路径超出屏幕，已停止。")
+                try await queue?.acquire(reservation)
+                defer {
+                    if let target, let queue {
+                        queue.release(reservation)
+                        if !queue.isOccupied { Self.windowQueues[target.pid] = nil }
                     }
                 }
-            } else {
-                try await emitter.send(at: resolved.position, window: resolved.window, mode: mode)
+                if state == .paused { continue }
+                try Task.checkCancellation()
+
+                let resolved = try resolve(point: point, target: target, initialSize: target?.frame.size)
+                if retryUntil != nil { note("已再次确认原目标窗口，继续当前步骤。") }
+                currentPoint = point.id
+                detail = stepDetail
+                try await send(point, resolved: resolved, mode: mode)
+                return
+            } catch where mode != .foreground && ((error as? WindowLookupError)?.canRetry == true || error is WindowSizeChanged) {
+                // Only a preflight lookup can reach this catch. No mouse event has been posted.
+                let now = clock.now
+                if retryUntil == nil {
+                    retryUntil = now.advanced(by: .milliseconds(500))
+                    detail = "暂时无法确认目标窗口，正在复查。"
+                    note(detail)
+                }
+                guard let deadline = retryUntil, now < deadline else { throw error }
+                try await clock.sleep(until: min(deadline, now.advanced(by: .milliseconds(50))))
             }
+        }
+    }
+
+    private typealias ResolvedAction = (position: CGPoint, end: CGPoint?, window: WindowTarget?)
+
+    private func send(_ point: ClickPoint, resolved: ResolvedAction, mode: ClickMode) async throws {
+        if mode == .foreground, let window = resolved.window {
+            try requireForeground(window, at: resolved.position)
+        }
+        guard let drag = point.drag, let end = resolved.end else {
+            try await emitter.send(at: resolved.position, window: resolved.window, mode: mode)
             return
+        }
+        if mode == .foreground, let window = resolved.window { try requireForeground(window, at: end) }
+        dragging = true
+        defer { dragging = false }
+        try await emitter.drag(from: resolved.position, to: end, duration: drag.duration,
+                               window: resolved.window, mode: mode) { position in
+            if let window = resolved.window {
+                try WindowCatalog.requireUnchangedDuringDrag(window)
+                if mode == .foreground { try self.requireForeground(window, at: position) }
+            } else if !Coordinates.isOnDisplay(position, displays: WindowCatalog.displayFrames) {
+                throw PlanError.message("拖动路径超出屏幕，已停止。")
+            }
         }
     }
 
@@ -245,7 +305,7 @@ final class RunEngine: ObservableObject {
         }
     }
 
-    private func resolve(point: ClickPoint, target: WindowTarget?, initialSize: CGSize?) throws -> (position: CGPoint, end: CGPoint?, window: WindowTarget?) {
+    private func resolve(point: ClickPoint, target: WindowTarget?, initialSize: CGSize?) throws -> ResolvedAction {
         if let target = target, let size = initialSize {
             let current = try WindowCatalog.resolve(target)
             let position = try Coordinates.windowPoint(point.position, frame: current.frame, initialSize: size)

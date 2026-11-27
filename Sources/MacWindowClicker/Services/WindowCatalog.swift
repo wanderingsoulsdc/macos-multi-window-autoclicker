@@ -14,6 +14,30 @@ struct WindowTarget: Identifiable, Equatable {
     var hint: TargetHint { TargetHint(owner: owner, title: label, bundleID: bundleID) }
 }
 
+enum WindowLookupError: LocalizedError {
+    case applicationEnded, applicationChanged, applicationHidden
+    case unavailable, missing(CGWindowID), offScreen(CGWindowID), invalidWindow(CGWindowID)
+
+    var canRetry: Bool {
+        switch self {
+        case .unavailable, .missing, .offScreen, .invalidWindow: return true
+        case .applicationEnded, .applicationChanged, .applicationHidden: return false
+        }
+    }
+
+    var errorDescription: String? {
+        switch self {
+        case .applicationEnded: return "目标应用已退出。"
+        case .applicationChanged: return "目标应用进程已更换，请重新选择窗口。"
+        case .applicationHidden: return "macOS 报告目标应用处于隐藏状态。"
+        case .unavailable: return "macOS 暂时未返回窗口状态。"
+        case .missing(let id): return "找不到原目标窗口（编号 \(id)）。窗口可能已关闭或重新创建，请重新选择。"
+        case .offScreen(let id): return "macOS 未确认目标窗口（编号 \(id)）在当前屏幕上。"
+        case .invalidWindow(let id): return "原目标窗口（编号 \(id)）的大小或显示状态暂时不适合操作。"
+        }
+    }
+}
+
 enum WindowCatalog {
     static func list(includeOwn: Bool = false, includeTitles: Bool = false) -> [WindowTarget] {
         guard let rows = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] else { return [] }
@@ -65,12 +89,46 @@ enum WindowCatalog {
     }
 
     static func resolve(_ target: WindowTarget) throws -> WindowTarget {
-        guard let app = NSRunningApplication(processIdentifier: target.pid), !app.isTerminated,
-              app.bundleIdentifier == target.bundleID, app.launchDate == target.launchDate,
-              let current = list().first(where: { $0.id == target.id && $0.pid == target.pid }) else {
-            throw PlanError.message("目标窗口已关闭、隐藏或最小化，已停止。请重新选择窗口。")
+        try resolve(target, confirmInScreenList: true)
+    }
+
+    private static func resolve(_ target: WindowTarget, confirmInScreenList: Bool) throws -> WindowTarget {
+        guard let app = NSRunningApplication(processIdentifier: target.pid), !app.isTerminated else {
+            throw WindowLookupError.applicationEnded
         }
-        return current
+        guard app.bundleIdentifier == target.bundleID, app.launchDate == target.launchDate else {
+            throw WindowLookupError.applicationChanged
+        }
+        guard !app.isHidden else { throw WindowLookupError.applicationHidden }
+        guard let rows = CGWindowListCopyWindowInfo(.optionIncludingWindow, target.id) as? [[String: Any]] else {
+            throw WindowLookupError.unavailable
+        }
+        guard let row = rows.first(where: { $0[kCGWindowNumber as String] as? UInt32 == target.id }) else {
+            throw WindowLookupError.missing(target.id)
+        }
+        guard row[kCGWindowOwnerPID as String] as? Int32 == target.pid else {
+            throw WindowLookupError.applicationChanged
+        }
+        let onScreenFlag = row[kCGWindowIsOnscreen as String] as? Bool
+        guard onScreenFlag != false else { throw WindowLookupError.offScreen(target.id) }
+        if confirmInScreenList || onScreenFlag == nil {
+            // A state transition can leave the per-window snapshot behind the current list.
+            guard let onScreen = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] else {
+                throw WindowLookupError.unavailable
+            }
+            guard onScreen.contains(where: {
+                $0[kCGWindowNumber as String] as? UInt32 == target.id && $0[kCGWindowOwnerPID as String] as? Int32 == target.pid
+            }) else { throw WindowLookupError.offScreen(target.id) }
+        }
+        guard row[kCGWindowLayer as String] as? Int == 0, (row[kCGWindowAlpha as String] as? Double ?? 1) > 0,
+              let bounds = row[kCGWindowBounds as String] as? [String: Any],
+              let frame = CGRect(dictionaryRepresentation: bounds as CFDictionary),
+              frame.width.isFinite, frame.height.isFinite, frame.origin.x.isFinite, frame.origin.y.isFinite,
+              frame.width >= 60, frame.height >= 40 else {
+            throw WindowLookupError.invalidWindow(target.id)
+        }
+        return WindowTarget(id: target.id, pid: target.pid, owner: target.owner, title: target.title,
+                            bundleID: target.bundleID, launchDate: target.launchDate, frame: frame)
     }
 
     static var displayFrames: [CGRect] {
@@ -82,15 +140,16 @@ enum WindowCatalog {
     }
     static var desktopFrame: CGRect { displayFrames.reduce(CGRect.null) { $0.union($1) } }
 
-    static func isUnchangedDuringDrag(_ target: WindowTarget) -> Bool {
-        guard let app = NSRunningApplication(processIdentifier: target.pid), !app.isTerminated, !app.isHidden,
-              app.launchDate == target.launchDate, app.bundleIdentifier == target.bundleID,
-              let rows = CGWindowListCopyWindowInfo(.optionIncludingWindow, target.id) as? [[String: Any]],
-              let row = rows.first(where: { $0[kCGWindowNumber as String] as? UInt32 == target.id }),
-              row[kCGWindowOwnerPID as String] as? Int32 == target.pid,
-              row[kCGWindowIsOnscreen as String] as? Bool == true,
-              let dict = row[kCGWindowBounds as String] as? [String: Any] else { return false }
-        return CGRect(dictionaryRepresentation: dict as CFDictionary) == target.frame
+    static func requireUnchangedDuringDrag(_ target: WindowTarget) throws {
+        let current: WindowTarget
+        do { current = try resolve(target, confirmInScreenList: false) }
+        catch { throw PlanError.message("拖动检查已中止 · \(error.localizedDescription)") }
+        guard current.frame.size == target.frame.size else {
+            throw PlanError.message("拖动中目标窗口大小发生变化，已中止。")
+        }
+        guard current.frame.origin == target.frame.origin else {
+            throw PlanError.message("拖动中目标窗口位置发生变化，已中止。")
+        }
     }
 
     static func isUnobstructed(_ target: WindowTarget, at point: CGPoint) -> Bool {

@@ -81,6 +81,8 @@ final class Target: NSObject, NSApplicationDelegate {
     var selfCheckPassed = false
     var eventMonitor: Any?
     var commandTimer: Timer?
+    var offScreenAt: TimeInterval?
+    var restoredAt: TimeInterval?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         let originX: CGFloat = CommandLine.arguments.contains("--secondary") ? 550 : 100
@@ -91,6 +93,7 @@ final class Target: NSObject, NSApplicationDelegate {
             window.title = CommandLine.arguments[index + 1]
         }
         window.isReleasedWhenClosed = false
+        window.animationBehavior = .none
         let button = NSButton(title: "标准按钮", target: self, action: #selector(pressed))
         button.frame = NSRect(x: 40, y: 215, width: 350, height: 45)
         button.setAccessibilityIdentifier("probe-button")
@@ -139,12 +142,29 @@ final class Target: NSObject, NSApplicationDelegate {
                     case "move": self.window.setFrameOrigin(NSPoint(x: command["x"] as? Double ?? 100, y: command["y"] as? Double ?? 180))
                     case "resize": self.window.setContentSize(NSSize(width: 500, height: 300))
                     case "close": self.window.orderOut(nil); self.window.close()
+                    case "offscreen", "brieflyOffscreen":
+                        self.window.orderOut(nil)
+                        self.offScreenAt = Date().timeIntervalSince1970
+                        self.restoredAt = nil
+                        if command["action"] as? String == "brieflyOffscreen" {
+                            Task { @MainActor [weak self] in
+                                try? await Task.sleep(for: .milliseconds(240))
+                                self?.restoreWindow()
+                            }
+                        }
+                    case "restore": self.restoreWindow(); return
                     default: break
                     }
                     self.publish()
                 }
             }
         }
+    }
+
+    private func restoreWindow() {
+        window.orderFrontRegardless()
+        restoredAt = Date().timeIntervalSince1970
+        publish()
     }
 
     @objc func pressed() { record("standardButton") }
@@ -162,11 +182,14 @@ final class Target: NSObject, NSApplicationDelegate {
                     "windowTopX": local.x, "windowTopY": window.frame.height - local.y,
                     "localX": local.x, "localY": local.y]
         }
-        writeJSON(["pid": ProcessInfo.processInfo.processIdentifier, "window": window.windowNumber,
-                   "frontPID": NSWorkspace.shared.frontmostApplication?.processIdentifier ?? -1,
-                   "frontBundle": NSWorkspace.shared.frontmostApplication?.bundleIdentifier ?? "unknown",
-                   "selfCheckPassed": selfCheckPassed, "rawEvents": rawEvents,
-                   "points": points, "events": events, "drags": drags], to: targetStateURL)
+        var snapshot: [String: Any] = ["pid": ProcessInfo.processInfo.processIdentifier, "window": window.windowNumber,
+                                       "frontPID": NSWorkspace.shared.frontmostApplication?.processIdentifier ?? -1,
+                                       "frontBundle": NSWorkspace.shared.frontmostApplication?.bundleIdentifier ?? "unknown",
+                                       "selfCheckPassed": selfCheckPassed, "rawEvents": rawEvents,
+                                       "points": points, "events": events, "drags": drags]
+        snapshot["offScreenAt"] = offScreenAt
+        snapshot["restoredAt"] = restoredAt
+        writeJSON(snapshot, to: targetStateURL)
     }
 }
 
