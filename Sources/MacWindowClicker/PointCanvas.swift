@@ -37,19 +37,22 @@ struct PointCanvas: View {
                         canvasBackground(size: transform.size)
                             .contentShape(Rectangle())
                             .gesture(SpatialTapGesture().onEnded { event in
-                                guard model.canEdit else { return }
-                                let point = transform.logicalPoint(event.location)
-                                if frame.contains(point) { model.addPoint(at: point) }
+                                model.tapCanvas(at: transform.logicalPoint(event.location))
                             })
                         ForEach(Array(model.plan.points.enumerated()), id: \.element.id) { index, point in
-                            if frame.contains(point.position) {
-                                CanvasPointMarker(point: point, number: index + 1, transform: transform,
-                                                  selected: model.selectedPoint == point.id,
-                                                  running: engine.currentPoint == point.id && engine.state.busy,
-                                                  editable: model.canEdit,
-                                                  select: { model.selectedPoint = point.id },
-                                                  move: { model.repositionPoint(point.id, to: $0) })
-                            }
+                            CanvasStep(point: point, number: index + 1, transform: transform,
+                                       selected: model.selectedPoint == point.id,
+                                       running: engine.currentPoint == point.id && engine.state.busy,
+                                       editable: model.canEdit,
+                                       select: { model.selectedPoint = point.id },
+                                       move: { model.repositionPoint(point.id, handle: $0, to: $1) })
+                                .allowsHitTesting(model.dragPlacement == nil)
+                                .zIndex(model.selectedPoint == point.id ? 1 : 0)
+                        }
+                        if case .end(let start) = model.dragPlacement, frame.contains(start) {
+                            Circle().fill(Color.accentColor).overlay(Circle().strokeBorder(.white, lineWidth: 2))
+                                .frame(width: 14, height: 14).position(transform.displayedPoint(start))
+                                .allowsHitTesting(false).accessibilityHidden(true).zIndex(2)
                         }
                     }
                     .frame(width: transform.size.width, height: transform.size.height)
@@ -61,11 +64,23 @@ struct PointCanvas: View {
                 .onChange(of: geometry.size) { _, size in updateFit(size) }
                 .onChange(of: model.canvasFrame) { _, _ in updateFit(geometry.size) }
             }.clipped()
-            Text(model.preview == nil ? "位置示意图；长按标记可拖动，对准按钮请用屏幕取点。" : "静态截图；点击标记选中，长按拖动调整位置。")
-                .font(.system(size: 10)).foregroundStyle(.secondary).lineLimit(2)
+            HStack {
+                Text(canvasHint).font(.system(size: 10)).foregroundStyle(.secondary).lineLimit(2)
+                if model.dragPlacement != nil {
+                    Button("取消", action: model.cancelDragPlacement).buttonStyle(.borderless).font(.caption)
+                }
+            }
         }
         .padding(12).frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(.primary.opacity(0.025), in: RoundedRectangle(cornerRadius: 10))
+    }
+    private var canvasHint: String {
+        switch model.dragPlacement {
+        case .start: return "点击画布，选择拖动起点。"
+        case .end: return "再点击画布，选择拖动终点。"
+        case nil:
+            return model.preview == nil ? "位置示意图。长按标记可调整位置。" : "静态截图。点击标记选中，长按可调整位置。"
+        }
     }
     private func updateFit(_ viewport: CGSize) {
         fitScale = Double(CanvasTransform(bounds: model.canvasFrame, viewport: viewport).scale)
@@ -99,7 +114,7 @@ struct PointCanvas: View {
 }
 
 
-private struct CanvasPointMarker: View {
+private struct CanvasStep: View {
     let point: ClickPoint
     let number: Int
     let transform: CanvasTransform
@@ -107,19 +122,22 @@ private struct CanvasPointMarker: View {
     let running: Bool
     let editable: Bool
     let select: () -> Void
-    let move: (CGPoint) -> Void
+    let move: (PointHandle, CGPoint) -> Void
     @GestureState private var interaction = MarkerInteraction()
-    private var position: CGPoint {
-        interaction.held ? (transform.draggedPoint(from: point.position, by: interaction.translation) ?? point.position) : point.position
+    private var tint: Color { running ? .orange : .accentColor }
+
+    private func position(for handle: PointHandle, at origin: CGPoint) -> CGPoint {
+        guard interaction.handle == handle else { return origin }
+        return transform.draggedPoint(from: origin, by: interaction.translation) ?? origin
     }
-    private var drag: some Gesture {
+    private func drag(_ handle: PointHandle, from origin: CGPoint) -> some Gesture {
         LongPressGesture(minimumDuration: 0.35, maximumDistance: 8)
             .sequenced(before: DragGesture(minimumDistance: 0, coordinateSpace: .named("pointCanvas")))
             .updating($interaction) { value, state, _ in
                 switch value {
-                case .first(let held): state.held = held
+                case .first(let held): state.handle = held ? handle : nil
                 case .second(let held, let drag):
-                    state.held = held
+                    state.handle = held ? handle : nil
                     state.translation = drag?.translation ?? .zero
                 }
             }
@@ -131,41 +149,78 @@ private struct CanvasPointMarker: View {
             }
             .onEnded { value in
                 guard editable, case .second(true, let drag?) = value,
-                      let position = transform.draggedPoint(from: point.position, by: drag.translation) else { return }
-                move(position)
+                      let position = transform.draggedPoint(from: origin, by: drag.translation) else { return }
+                move(handle, position)
             }
     }
-    private var marker: some View {
-        Text(String(number)).font(.system(size: 11, weight: .bold, design: .rounded))
-            .foregroundStyle(.white).frame(width: 25, height: 25)
-            .background(running ? Color.orange : Color.accentColor, in: Circle())
-            .overlay(Circle().stroke(.white, lineWidth: selected || interaction.held ? 3 : 1.5))
-            .shadow(color: .black.opacity(interaction.held ? 0.3 : 0.18), radius: interaction.held ? 6 : 3, y: 1)
-            .scaleEffect(interaction.held ? 1.2 : 1)
-            .contentShape(Circle())
-            .opacity(point.enabled ? 1 : 0.35)
-    }
-    var body: some View {
-        let logical = position
+
+    private func marker(_ handle: PointHandle, origin: CGPoint, label: String) -> some View {
+        let logical = position(for: handle, at: origin)
         let location = transform.displayedPoint(logical)
         let coordinates = "X \(Int(logical.x))，Y \(Int(logical.y))"
         let hint = editable ? "长按并拖动调整位置" : "运行期间不能调整位置"
-        return marker
+        let held = interaction.handle == handle
+        let size: CGFloat = handle == .end ? 20 : 25
+        return Group {
+            if handle == .end { Image(systemName: "flag.fill") }
+            else { Text(String(number)) }
+        }
+            .font(.system(size: handle == .end ? 9 : 11, weight: .bold, design: .rounded))
+            .foregroundStyle(.white).frame(width: size, height: size)
+            .background(tint, in: Circle())
+            .overlay(Circle().stroke(.white, lineWidth: selected || held ? 3 : 1.5))
+            .shadow(color: .black.opacity(held ? 0.3 : 0.18), radius: held ? 6 : 3, y: 1)
+            .scaleEffect(held ? 1.2 : 1)
+            .contentShape(Circle())
             .onTapGesture(perform: select)
-            .highPriorityGesture(drag, including: editable ? .all : .none)
+            .highPriorityGesture(drag(handle, from: origin), including: editable ? .all : .none)
             .position(location)
-            .zIndex(interaction.held ? 1 : 0)
-            .help(point.name + " · " + coordinates + " · " + hint)
+            .zIndex(held ? 2 : 1)
+            .help(label + " · " + coordinates + " · " + hint)
             .accessibilityElement()
-            .accessibilityLabel(Text("点击点 \(number)"))
+            .accessibilityLabel(Text(label))
             .accessibilityValue(Text(coordinates))
             .accessibilityHint(Text(hint))
             .accessibilityAddTraits(.isButton)
             .accessibilityAction { select() }
     }
+
+    var body: some View {
+        let start = point.position
+        let end = point.drag?.end
+        ZStack(alignment: .topLeading) {
+            if let end, transform.bounds.contains(start), transform.bounds.contains(end) {
+                route(from: transform.displayedPoint(position(for: .start, at: start)),
+                      to: transform.displayedPoint(position(for: .end, at: end)))
+                    .stroke(tint, style: StrokeStyle(lineWidth: selected ? 2 : 1.5, lineCap: .round, lineJoin: .round))
+                    .allowsHitTesting(false).accessibilityHidden(true)
+            }
+            if transform.bounds.contains(start) {
+                marker(.start, origin: start, label: end == nil ? "点击点 \(number)" : "拖动 \(number) 起点")
+            }
+            if let end, transform.bounds.contains(end) {
+                marker(.end, origin: end, label: "拖动 \(number) 终点")
+            }
+        }.opacity(point.enabled ? 1 : 0.35)
+    }
+
+    private func route(from start: CGPoint, to end: CGPoint) -> Path {
+        Path { path in
+            path.move(to: start)
+            path.addLine(to: end)
+            let length = hypot(end.x - start.x, end.y - start.y)
+            guard length > 34 else { return }
+            let dx = (end.x - start.x) / length, dy = (end.y - start.y) / length
+            let tip = CGPoint(x: end.x - dx * 12, y: end.y - dy * 12)
+            let base = CGPoint(x: tip.x - dx * 6, y: tip.y - dy * 6)
+            path.move(to: CGPoint(x: base.x - dy * 4, y: base.y + dx * 4))
+            path.addLine(to: tip)
+            path.addLine(to: CGPoint(x: base.x + dy * 4, y: base.y - dx * 4))
+        }
+    }
 }
 
 private struct MarkerInteraction {
-    var held = false
+    var handle: PointHandle?
     var translation = CGSize.zero
 }

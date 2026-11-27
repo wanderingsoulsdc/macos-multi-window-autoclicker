@@ -4,6 +4,12 @@ import UniformTypeIdentifiers
 import ApplicationServices
 import ClickerCore
 
+enum DragPlacement: Equatable {
+    case start, end(CGPoint)
+}
+
+enum PointHandle { case start, end }
+
 @MainActor
 final class WorkspaceModel: ObservableObject {
     @Published private(set) var sessions: [WindowSession] = []
@@ -13,6 +19,7 @@ final class WorkspaceModel: ObservableObject {
     @Published var query = ""
     @Published var message: String?
     @Published var refreshing = false
+    @Published private(set) var dragPlacement: DragPlacement?
     @Published var accessibility = AXIsProcessTrusted()
     @Published var eventAccess = CGPreflightPostEventAccess()
     @Published private(set) var saveLabel = "自动保存"
@@ -75,6 +82,7 @@ final class WorkspaceModel: ObservableObject {
     func selectSession(_ id: UUID) {
         guard sessions.contains(where: { $0.id == id }), id != selectedSessionID else { return }
         NSApp.keyWindow?.makeFirstResponder(nil); picker.cancel()
+        cancelDragPlacement()
         selectedSessionID = id; changes.send()
     }
     func requestClose(_ id: UUID) {
@@ -86,6 +94,7 @@ final class WorkspaceModel: ObservableObject {
     }
     private func closeSession(_ id: UUID) {
         guard let index = sessions.firstIndex(where: { $0.id == id }) else { return }
+        if id == selectedSessionID { cancelDragPlacement() }
         picker.cancel(); sessions[index].engine.shutdown()
         sessions.remove(at: index)
         if sessions.isEmpty {
@@ -136,6 +145,7 @@ final class WorkspaceModel: ObservableObject {
     }
     func choose(_ window: WindowTarget?) {
         NSApp.keyWindow?.makeFirstResponder(nil); picker.cancel()
+        cancelDragPlacement()
         if let existing = sessions.first(where: { session in
             if let window { return session.target?.id == window.id && session.target?.pid == window.pid && session.target?.launchDate == window.launchDate }
             return !session.plan.windowCoordinates
@@ -158,6 +168,7 @@ final class WorkspaceModel: ObservableObject {
     }
     @discardableResult private func appendSession(_ plan: ClickPlan) -> Bool {
         guard sessions.count < 30 else { message = "最多保留 30 个标签，请先关闭不需要的标签。"; return false }
+        cancelDragPlacement()
         let session = WindowSession(saved: SavedSession(plan: plan))
         sessions.append(session); selectedSessionID = session.id
         observeSessions(); changes.send()
@@ -169,35 +180,110 @@ final class WorkspaceModel: ObservableObject {
         if appendSession(blank) { allowAutosave = true; changes.send() }
     }
     func addPoint(at position: CGPoint? = nil) {
-        guard canEdit, plan.points.count < 500 else { return }
+        guard canEdit, plan.points.count < ClickPlan.maximumSteps else { return }
         let fallback = plan.windowCoordinates ? CGPoint(x: canvasFrame.midX, y: canvasFrame.midY) : CGPoint(x: CGDisplayBounds(CGMainDisplayID()).midX, y: CGDisplayBounds(CGMainDisplayID()).midY)
         let p = position ?? fallback
         let point = ClickPoint(name: "点击点 \(plan.points.count + 1)", x: floor(p.x), y: floor(p.y))
         plan.points.append(point); selectedPoint = point.id
     }
-    func repositionPoint(_ id: UUID, to position: CGPoint) {
+    func beginDragPlacement() {
+        guard canEdit, plan.points.count < ClickPlan.maximumSteps else { return }
+        NSApp.keyWindow?.makeFirstResponder(nil)
+        picker.cancel()
+        dragPlacement = .start
+    }
+
+    func cancelDragPlacement() {
+        if dragPlacement != nil { dragPlacement = nil }
+    }
+
+    func tapCanvas(at position: CGPoint) {
+        guard canEdit, plan.points.count < ClickPlan.maximumSteps, canvasFrame.contains(position) else { return }
+        guard let dragPlacement else { addPoint(at: position); return }
+        let coordinate = CGPoint(x: floor(position.x), y: floor(position.y))
+        switch dragPlacement {
+        case .start:
+            self.dragPlacement = .end(coordinate)
+        case .end(let start):
+            guard coordinate != start else { return }
+            let point = ClickPoint(name: "拖动 \(plan.points.count + 1)", x: start.x, y: start.y,
+                                   drag: DragMotion(end: coordinate))
+            plan.points.append(point)
+            selectedPoint = point.id
+            cancelDragPlacement()
+        }
+    }
+
+    func repositionPoint(_ id: UUID, handle: PointHandle, to position: CGPoint) {
         guard canEdit, position.x.isFinite, position.y.isFinite,
               canvasFrame.contains(position), let index = plan.points.firstIndex(where: { $0.id == id }) else { return }
+        var point = plan.points[index]
+        switch handle {
+        case .start:
+            guard position != point.drag?.end else { return }
+            point.x = position.x
+            point.y = position.y
+        case .end:
+            guard point.drag != nil, position != point.position else { return }
+            point.drag?.endX = position.x
+            point.drag?.endY = position.y
+        }
+        plan.points[index] = point
         selectedPoint = id
-        plan.points[index].x = position.x
-        plan.points[index].y = position.y
     }
     func removePoint(_ id: UUID) {
+        removePoints([id])
+    }
+    func removePoints(_ ids: Set<UUID>) {
+        guard canEdit, !ids.isEmpty else { return }
+        plan.points.removeAll { ids.contains($0.id) }
+        if let selectedPoint, ids.contains(selectedPoint) { self.selectedPoint = plan.points.first?.id }
+    }
+    func setAllPointsEnabled(_ enabled: Bool) {
         guard canEdit else { return }
-        plan.points.removeAll { $0.id == id }
-        if selectedPoint == id { selectedPoint = plan.points.first?.id }
+        plan.points = plan.points.map { point in
+            var point = point
+            point.enabled = enabled
+            return point
+        }
     }
     func movePoint(_ id: UUID, by offset: Int) {
-        guard canEdit, let index = plan.points.firstIndex(where: { $0.id == id }), plan.points.indices.contains(index + offset) else { return }
-        plan.points.swapAt(index, index + offset)
+        guard canEdit else { return }
+        let siblings: [UUID]
+        if let groupID = plan.points.first(where: { $0.id == id })?.groupID {
+            siblings = plan.points.filter { $0.groupID == groupID }.map(\.id)
+        } else { siblings = plan.executionBlocks.map(\.id) }
+        guard let index = siblings.firstIndex(of: id), siblings.indices.contains(index + offset) else { return }
+        movePoint(id, relativeTo: siblings[index + offset], placement: offset < 0 ? .before : .after)
     }
-    func duplicate(_ id: UUID) {
-        guard canEdit, plan.points.count < 500, let index = plan.points.firstIndex(where: { $0.id == id }) else { return }
-        var point = plan.points[index]; point.id = UUID(); point.name += " 副本"
-        plan.points.insert(point, at: index + 1); selectedPoint = point.id
+    func movePoint(_ id: UUID, relativeTo otherID: UUID, placement: ClickPlan.MovePlacement) {
+        guard canEdit else { return }
+        var updated = plan
+        guard updated.moveStep(id, relativeTo: otherID, placement: placement) else { return }
+        plan = updated
+        if updated.points.contains(where: { $0.id == id }) { selectedPoint = id }
+    }
+    func createGroup(start: UUID, end: UUID, name: String, rounds: Int) throws {
+        guard canEdit else { throw PlanError.message("请在任务停止后编辑循环组。") }
+        try plan.createGroup(start: start, end: end, name: name, rounds: rounds)
+    }
+    func editGroup(_ id: UUID, name: String, rounds: Int) throws {
+        guard canEdit else { throw PlanError.message("请在任务停止后编辑循环组。") }
+        try plan.editGroup(id, name: name, rounds: rounds)
+    }
+    func ungroup(_ id: UUID) {
+        if canEdit { plan.ungroup(id) }
+    }
+    func duplicate(_ ids: Set<UUID>, placement: ClickPlan.DuplicatePlacement) {
+        guard canEdit else { return }
+        var updated = plan
+        guard let firstCopy = updated.duplicateSteps(ids, placement: placement) else { return }
+        plan = updated
+        selectedPoint = firstCopy
     }
     func pickPoint() {
         guard canEdit else { return }
+        cancelDragPlacement()
         let session = activeSession
         do {
             let frame = try target.map { try WindowCatalog.resolve($0).frame }
@@ -246,15 +332,17 @@ final class WorkspaceModel: ObservableObject {
     }
     func start() {
         NSApp.keyWindow?.makeFirstResponder(nil)
+        cancelDragPlacement()
         guard hotkeys.stopAvailable else { message = "紧急停止快捷键注册失败，可能被其他软件占用。请退出冲突软件后重新打开Mac多窗口连点器。"; return }
         engine.start(plan: plan, target: plan.windowCoordinates ? target : nil)
     }
     func testSelectedPoint() {
         NSApp.keyWindow?.makeFirstResponder(nil)
+        cancelDragPlacement()
         guard canEdit, let id = selectedPoint, var point = plan.points.first(where: { $0.id == id }) else { return }
         guard hotkeys.stopAvailable else { message = "紧急停止快捷键不可用，请重新打开应用。"; return }
         var test = plan
-        point.count = 1; point.enabled = true
+        point.count = 1; point.enabled = true; point.groupID = nil
         test.points = [point]; test.rounds = 1; test.repeatForever = false
         if test.startMode == .scheduled {
             test.startDelay = test.mode == .foreground ? 3 : 0

@@ -68,6 +68,85 @@ final class IntegrationController: NSObject, NSApplicationDelegate {
         return ClickPoint(name: name, x: x, y: y, count: count, interval: 0.12)
     }
     var actions: [String] { (json(targetURL)["events"] as? [[String: Any]] ?? []).compactMap { $0["control"] as? String } }
+    var drags: [[String: Any]] { json(targetURL)["drags"] as? [[String: Any]] ?? [] }
+    var lastEventType: UInt? { (json(targetURL)["rawEvents"] as? [[String: Any]])?.last?["type"] as? UInt }
+
+    func checkLoopGroups(target: WindowTarget) async throws {
+        var plan = ClickPlan()
+        plan.windowCoordinates = true
+        plan.mode = .commandBackground
+        plan.startMode = .immediate
+        plan.rounds = 2
+        let entry = try point("standardButton", target: target)
+        let groupFirst = try point("acceptingView", target: target)
+        let groupLast = try point("defaultView", target: target)
+        var disabled = try point("acceptingView", target: target)
+        disabled.enabled = false
+        let exit = try point("standardButton", target: target)
+        plan.points = [entry, groupFirst, disabled, groupLast, exit]
+        try plan.createGroup(start: groupFirst.id, end: groupLast.id, name: "组内循环", rounds: 2)
+        let firstAction = actions.count
+        engine.start(plan: plan, target: target)
+        try await wait { !engine.state.busy }
+        let round = ["standardButton", "acceptingView", "defaultView", "acceptingView", "defaultView", "standardButton"]
+        try require(engine.state == .finished && engine.sent == 12 && engine.total == 12 &&
+                    Array(actions.dropFirst(firstAction)) == round + round,
+                    "外层两轮和组内两次循环按顺序执行，跳过禁用项，进度正确")
+    }
+
+    func checkDrags(target: WindowTarget) async throws {
+        var plan = ClickPlan()
+        plan.windowCoordinates = true
+        plan.startMode = .immediate
+        let click = try point("standardButton", target: target)
+        var drag = try point("acceptingView", target: target, count: 2)
+        let end = CGPoint(x: drag.x + 90, y: drag.y - 20)
+        drag.drag = DragMotion(end: end, duration: 0.4)
+        plan.points = [click, drag, ClickPoint(name: "最后点击", x: click.x, y: click.y, interval: click.interval)]
+
+        for mode in [ClickMode.background, .commandBackground] {
+            plan.mode = mode
+            let startIndex = actions.count
+            let firstDrag = drags.count
+            engine.start(plan: plan, target: target)
+            try await wait { !engine.state.busy }
+            try require(engine.state == .finished && engine.sent == 4 &&
+                        Array(actions.dropFirst(startIndex)) == ["standardButton", "acceptingView", "acceptingView", "standardButton"],
+                        "\(mode.title(includesDrag: true))按顺序完成点击、拖动两次、再点击")
+            let received = Array(drags.dropFirst(firstDrag))
+            let expectedCommand = mode == .commandBackground
+            let correct = received.count == 2 && received.allSatisfy { row in
+                guard let start = row["start"] as? [Double], let finish = row["end"] as? [Double],
+                      let last = row["last"] as? [Double], let moves = row["moves"] as? Int,
+                      let flags = row["flags"] as? UInt, let duration = row["duration"] as? Double,
+                      start.count == 2, finish.count == 2 else { return false }
+                return abs(finish[0] - start[0] - 90) < 1 && abs(finish[1] - start[1] - 20) < 1 &&
+                    finish == last && moves >= 2 && duration >= 0.3 &&
+                    NSEvent.ModifierFlags(rawValue: flags).contains(.command) == expectedCommand
+            }
+            try require(correct, "\(mode.title(includesDrag: true))的轨迹、终点和修饰键匹配")
+        }
+
+        plan.mode = .background
+        drag.drag?.duration = 2
+        plan.points = [drag]
+        let firstDrag = drags.count
+        engine.start(plan: plan, target: target)
+        try await wait { self.lastEventType == NSEvent.EventType.leftMouseDragged.rawValue }
+        engine.stop()
+        try await wait { !engine.state.busy && self.drags.count == firstDrag + 1 }
+        try require(engine.state == .stopped && engine.sent == 0 &&
+                    lastEventType == NSEvent.EventType.leftMouseUp.rawValue,
+                    "拖动中停止会松开鼠标，部分拖动不计为已完成")
+
+        var invalid = drag
+        invalid.drag?.endX = target.frame.width
+        plan.points = [invalid]
+        let before = actions.count
+        engine.start(plan: plan, target: target)
+        try require(engine.state == .failed && actions.count == before, "终点超出窗口时在按下前阻止运行")
+    }
+
     func run() async {
         do {
             try require(AXIsProcessTrusted() && CGPreflightPostEventAccess(), "验证工具权限已就绪")
@@ -93,14 +172,22 @@ final class IntegrationController: NSObject, NSApplicationDelegate {
             try await wait { !engine.state.busy }
             try require(engine.state == .finished && engine.sent == 2 && Array(actions.dropFirst(previousActions)) == ["defaultView", "defaultView"], "显式 Command 模式收到两次特殊点击")
 
+            try await checkDrags(target: target)
+            try await checkLoopGroups(target: target)
+
             let secondaryURL = resultDir.appendingPathComponent("secondary-target.json")
             try? FileManager.default.removeItem(at: secondaryURL)
             let child = Process()
             child.executableURL = root.appendingPathComponent("Validation/build/ProbeTarget.app/Contents/MacOS/ProbeTarget")
-            child.arguments = ["--target", "--state", secondaryURL.path]
+            child.arguments = ["--target", "--secondary", "--state", secondaryURL.path]
             try child.run(); secondProcess = child
             try await wait { json(secondaryURL)["pid"] as? Int == Int(child.processIdentifier) && json(secondaryURL)["selfCheckPassed"] as? Bool == true }
-            guard let otherTarget = WindowCatalog.list().first(where: { $0.pid == child.processIdentifier }) else { throw PlanError.message("缺少第二个靶窗口") }
+            var secondWindow: WindowTarget?
+            try await wait {
+                secondWindow = WindowCatalog.list().first(where: { $0.pid == child.processIdentifier })
+                return secondWindow != nil
+            }
+            guard let otherTarget = secondWindow else { throw PlanError.message("缺少第二个靶窗口") }
             var parallel = plan; parallel.rounds = 1; parallel.repeatForever = true
             parallel.points = [try point("standardButton", target: target)]
             var otherPlan = parallel
@@ -108,7 +195,10 @@ final class IntegrationController: NSObject, NSApplicationDelegate {
             let firstActions = actions.count
             engine.start(plan: parallel, target: target)
             secondEngine.start(plan: otherPlan, target: otherTarget)
-            try await wait { engine.sent >= 3 && secondEngine.sent >= 3 }
+            try await wait {
+                engine.sent >= 3 && secondEngine.sent >= 3 && actions.count >= firstActions + 3 &&
+                    (json(secondaryURL)["events"] as? [[String: Any]] ?? []).count >= 3
+            }
             try require(engine.state.busy && secondEngine.state.busy && actions.count >= firstActions + 3 && (json(secondaryURL)["events"] as? [[String: Any]] ?? []).count >= 3, "两个真实窗口同时收到各自后台点击")
             engine.togglePause()
             try await Task.sleep(nanoseconds: 80_000_000)

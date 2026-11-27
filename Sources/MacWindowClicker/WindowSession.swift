@@ -25,6 +25,6 @@ final class WindowSession: ObservableObject, Identifiable {
         }
         if engine.state.busy { return "\(engine.state.title) · \(engine.sent)\(engine.total.map { "/\($0)" } ?? "")" }
         if plan.windowCoordinates && target == nil { return "请选择窗口重新绑定" }
-        return engine.state == .idle ? "\(plan.points.count) 个点击点" : "\(engine.state.title) · \(engine.sent) 次"
+        return engine.state == .idle ? "\(plan.points.count) 步" : "\(engine.state.title) · \(engine.sent) 次"
     }
 }

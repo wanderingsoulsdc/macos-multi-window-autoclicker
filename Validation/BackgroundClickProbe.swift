@@ -42,8 +42,27 @@ func permissions() -> [String: Any] {
 final class TestView: NSView {
     var firstClick = false
     var received: (() -> Void)?
+    var receivedDrag: ((CGPoint, CGPoint, CGPoint, Int, TimeInterval, UInt) -> Void)?
+    private var dragStart: (position: CGPoint, time: TimeInterval, flags: UInt)?
+    private var lastMovement: CGPoint?
+    private var movementCount = 0
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { firstClick }
-    override func mouseDown(with event: NSEvent) { received?() }
+    override func mouseDown(with event: NSEvent) {
+        dragStart = (event.locationInWindow, event.timestamp, event.modifierFlags.rawValue)
+        lastMovement = nil
+        movementCount = 0
+        received?()
+    }
+    override func mouseDragged(with event: NSEvent) {
+        lastMovement = event.locationInWindow
+        movementCount += 1
+    }
+    override func mouseUp(with event: NSEvent) {
+        defer { dragStart = nil; lastMovement = nil }
+        guard let start = dragStart, let lastMovement else { return }
+        receivedDrag?(start.position, lastMovement, event.locationInWindow, movementCount,
+                      event.timestamp - start.time, start.flags)
+    }
     override func draw(_ dirtyRect: NSRect) {
         NSColor.controlBackgroundColor.setFill()
         bounds.fill()
@@ -58,12 +77,14 @@ final class Target: NSObject, NSApplicationDelegate {
     var events: [[String: Any]] = []
     var controls: [(String, NSView)] = []
     var rawEvents: [[String: Any]] = []
+    var drags: [[String: Any]] = []
     var selfCheckPassed = false
     var eventMonitor: Any?
     var commandTimer: Timer?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        window = NSWindow(contentRect: NSRect(x: 100, y: 180, width: 430, height: 300),
+        let originX: CGFloat = CommandLine.arguments.contains("--secondary") ? 550 : 100
+        window = NSWindow(contentRect: NSRect(x: originX, y: 180, width: 430, height: 300),
                           styleMask: [.titled, .closable], backing: .buffered, defer: false)
         window.title = "后台点击验证 · 测试靶窗口"
         if let index = CommandLine.arguments.firstIndex(of: "--name"), CommandLine.arguments.indices.contains(index + 1) {
@@ -80,6 +101,12 @@ final class Target: NSObject, NSApplicationDelegate {
             view.firstClick = accepts
             let name = accepts ? "acceptingView" : "defaultView"
             view.received = { [weak self] in self?.record(name) }
+            view.receivedDrag = { [weak self] start, last, end, count, duration, flags in
+                guard let self else { return }
+                self.drags.append(["control": name, "start": [start.x, start.y], "last": [last.x, last.y],
+                                   "end": [end.x, end.y], "moves": count, "duration": duration, "flags": flags])
+                self.publish()
+            }
             window.contentView!.addSubview(view)
             controls.append((name, view))
         }
@@ -92,7 +119,7 @@ final class Target: NSObject, NSApplicationDelegate {
         }
         selfCheckPassed = Set(events.compactMap { $0["control"] as? String }) == Set(controls.map { $0.0 })
         events.removeAll()
-        eventMonitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .leftMouseUp]) { [weak self] event in
+        eventMonitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .leftMouseDragged, .leftMouseUp]) { [weak self] event in
             guard let self = self else { return event }
             self.rawEvents.append(["type": event.type.rawValue, "window": event.windowNumber,
                                    "x": event.locationInWindow.x, "y": event.locationInWindow.y,
@@ -139,7 +166,7 @@ final class Target: NSObject, NSApplicationDelegate {
                    "frontPID": NSWorkspace.shared.frontmostApplication?.processIdentifier ?? -1,
                    "frontBundle": NSWorkspace.shared.frontmostApplication?.bundleIdentifier ?? "unknown",
                    "selfCheckPassed": selfCheckPassed, "rawEvents": rawEvents,
-                   "points": points, "events": events], to: targetStateURL)
+                   "points": points, "events": events, "drags": drags], to: targetStateURL)
     }
 }
 

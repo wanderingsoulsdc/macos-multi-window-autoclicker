@@ -8,6 +8,7 @@ struct MainView: View {
     @AppStorage("workspace.arrangement") private var arrangementRaw = WorkspaceArrangement.stacked.rawValue
     @AppStorage("workspace.stackedProportion") private var stackedProportion = 0.62
     @AppStorage("workspace.sideProportion") private var sideProportion = 0.56
+    @State private var pendingStepDeletion: Set<UUID>?
     private var arrangement: WorkspaceArrangement { WorkspaceArrangement(rawValue: arrangementRaw) ?? .stacked }
     private var splitProportion: Binding<Double> {
         Binding(get: { arrangement == .stacked ? stackedProportion : sideProportion },
@@ -31,6 +32,7 @@ struct MainView: View {
             RunBar(model: model, engine: engine)
         }
         .background(Color(nsColor: .windowBackgroundColor))
+        .onExitCommand { model.cancelDragPlacement() }
         .onReceive(permissionTimer) { _ in model.refreshPermissions() }
         .alert("提示", isPresented: Binding(get: { model.message != nil }, set: { if !$0 { model.message = nil } })) {
             Button("知道了", role: .cancel) { model.message = nil }
@@ -96,7 +98,7 @@ struct MainView: View {
     private var sidebar: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack {
-                Text("点击目标").font(.headline)
+                Text("操作目标").font(.headline)
                 Spacer()
                 Button { model.refreshWindows() } label: { Image(systemName: "arrow.clockwise") }
                     .buttonStyle(.borderless).help("刷新窗口列表").accessibilityLabel("刷新窗口列表").disabled(model.refreshing)
@@ -155,15 +157,16 @@ struct MainView: View {
                     Text(model.coordinateNote).font(.caption).foregroundStyle(.secondary)
                 }
                 Spacer(minLength: 8)
-                Picker("点击方式", selection: $model.plan.mode) {
+                Picker("操作模式", selection: $model.plan.mode) {
                     ForEach(ClickMode.allCases) { mode in
-                        Text(mode.title).tag(mode).disabled(!model.plan.windowCoordinates && mode != .foreground)
+                        Text(mode.title(includesDrag: model.plan.includesDrag)).tag(mode)
+                            .disabled(!model.plan.windowCoordinates && mode != .foreground)
                     }
                 }.labelsHidden().frame(width: 190).disabled(!model.canEdit)
             }
             modeNote
             HStack {
-                Text("预览与点击顺序").font(.caption).foregroundStyle(.secondary)
+                Text("预览与执行顺序").font(.caption).foregroundStyle(.secondary)
                 Spacer()
                 Picker("预览布局", selection: $arrangementRaw) {
                     ForEach(WorkspaceArrangement.allCases) { choice in
@@ -199,39 +202,70 @@ struct MainView: View {
             VStack(alignment: .leading, spacing: 4) {
                 Label("尽量不移动鼠标、不切换前台；发送结束不代表目标已响应。", systemImage: "cursorarrow.motionlines")
                 if model.target?.bundleID?.localizedCaseInsensitiveContains("wechat") == true {
-                    Text("微信小游戏可能需要「后台 Command 点击」；切换后请先单次试点确认。")
+                    Text("微信小游戏可能需要后台 Command 模式，切换后可先单次试运行。")
                         .foregroundStyle(.orange)
                 }
             }.font(.system(size: 11)).foregroundStyle(.secondary)
         case .commandBackground:
-            Label("带 Command 的点击可能触发多选或打开新标签，请确认目标软件的含义。", systemImage: "command")
+            Label("部分软件会为带 Command 的操作赋予不同含义，请先单次试运行。", systemImage: "command")
                 .font(.system(size: 11)).foregroundStyle(.orange)
         case .foreground:
-            Label("前台任务依次执行。开始点击时，目标窗口须在前台且无遮挡。", systemImage: "cursorarrow")
+            Label("前台任务依次执行。操作时目标窗口须在前台且无遮挡。", systemImage: "cursorarrow")
                 .font(.system(size: 11)).foregroundStyle(.orange)
         }
     }
 
     private var sequencePanel: some View {
         VStack(alignment: .leading, spacing: 10) {
-            HStack {
-                Text("点击顺序").font(.headline)
-                Text("\(model.plan.points.count) 个点").font(.caption).foregroundStyle(.secondary)
+            HStack(spacing: 6) {
+                Text("执行顺序").font(.headline)
+                Text("\(model.plan.points.count) 步").font(.caption).foregroundStyle(.secondary)
                 Spacer(minLength: 0)
+                batchStepMenu
             }
             HStack(spacing: 10) {
-                Button { model.testSelectedPoint() } label: { Label("单次试点", systemImage: "target") }
-                    .disabled(!model.canEdit || model.selectedPoint == nil || (model.plan.windowCoordinates && model.target == nil))
-                    .help("只点击当前选中的点一次，不修改方案")
+                Button { model.testSelectedPoint() } label: { Label("单次试运行", systemImage: "target") }
+                    .disabled(!model.canEdit || model.dragPlacement != nil || model.selectedPoint == nil || (model.plan.windowCoordinates && model.target == nil))
+                    .help("执行选中的步骤一次")
                 Button { model.pickPoint() } label: { Label("屏幕取点", systemImage: "scope") }
                     .disabled(!model.canEdit || (model.plan.windowCoordinates && model.target == nil))
                 Spacer(minLength: 0)
-                Button { model.addPoint() } label: { Image(systemName: "plus") }
-                    .help("手动添加点击点").accessibilityLabel("添加点击点").disabled(!model.canEdit)
+                Menu {
+                    Button("添加点击点", systemImage: "cursorarrow.click") { model.cancelDragPlacement(); model.addPoint() }
+                    Button("添加拖动", systemImage: "arrow.right") { model.beginDragPlacement() }
+                } label: { Image(systemName: "plus") }
+                    .fixedSize().help("添加点击点或拖动").accessibilityLabel("添加步骤")
+                    .disabled(!model.canEdit || model.plan.points.count >= ClickPlan.maximumSteps)
             }.font(.system(size: 11)).controlSize(.small)
             pointList.frame(maxHeight: .infinity)
         }
         .padding(arrangement == .stacked ? .top : .leading, 5)
+        .alert("删除已勾选的 \(pendingStepDeletion?.count ?? 0) 步？", isPresented: Binding(
+            get: { pendingStepDeletion != nil }, set: { if !$0 { pendingStepDeletion = nil } }
+        ), presenting: pendingStepDeletion) { ids in
+            Button("删除", role: .destructive) { model.removePoints(ids) }
+            Button("取消", role: .cancel) {}
+        } message: { _ in
+            Text("这些步骤将从当前方案移除，并自动保存。")
+        }
+    }
+
+    private var batchStepMenu: some View {
+        let checked = Set(model.plan.activePoints.map(\.id))
+        let count = model.plan.points.count
+        let canCopy = !checked.isEmpty && count + checked.count <= ClickPlan.maximumSteps
+        return Menu("批量 · \(checked.count)") {
+            Button("全部勾选") { model.setAllPointsEnabled(true) }.disabled(checked.count == count)
+            Button("全部取消勾选") { model.setAllPointsEnabled(false) }.disabled(checked.isEmpty)
+            Divider()
+            Button("复制到各条下方") { model.duplicate(checked, placement: .belowEach) }.disabled(!canCopy)
+            Button("复制到列表底部") { model.duplicate(checked, placement: .bottom) }.disabled(!canCopy)
+            Button("删除已勾选步骤", role: .destructive) { pendingStepDeletion = checked }.disabled(checked.isEmpty)
+        }
+        .controlSize(.small).fixedSize()
+        .accessibilityLabel("批量操作，已勾选 \(checked.count) 步")
+        .help("对已勾选步骤批量操作。勾选也决定哪些步骤会执行。")
+        .disabled(!model.canEdit || count == 0)
     }
 
     private var pointList: some View {
@@ -239,17 +273,12 @@ struct MainView: View {
             if model.plan.points.isEmpty {
                 VStack(spacing: 10) {
                     Image(systemName: "plus.circle.dashed").font(.system(size: 28)).foregroundStyle(.tertiary)
-                    Text("还没有点击点").font(.system(size: 13, weight: .medium))
-                    Text("使用屏幕取点、点击上方画布，或点 + 手动添加。").font(.caption).foregroundStyle(.secondary)
+                    Text("还没有步骤").font(.system(size: 13, weight: .medium))
+                    Text("点击画布添加点击点，或从 + 菜单添加拖动。")
+                        .font(.caption).foregroundStyle(.secondary).multilineTextAlignment(.center)
                 }.frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
-                ScrollView {
-                    LazyVStack(spacing: 4) {
-                        ForEach(Array(model.plan.points.enumerated()), id: \.element.id) { index, point in
-                            PointRow(model: model, engine: engine, point: point, index: index)
-                        }
-                    }.padding(5)
-                }
+                StepList(model: model, engine: engine)
             }
         }.background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 9))
             .overlay(RoundedRectangle(cornerRadius: 9).stroke(.primary.opacity(0.06)))
@@ -258,11 +287,12 @@ struct MainView: View {
     private var inspector: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 19) {
-                Text("点击点设置").font(.headline)
-                if let id = model.selectedPoint, model.plan.points.contains(where: { $0.id == id }) {
-                    PointInspector(model: model, id: id).disabled(!model.canEdit)
+                if let point = model.plan.points.first(where: { $0.id == model.selectedPoint }) {
+                    Text("\(point.kind)设置").font(.headline)
+                    PointInspector(model: model, id: point.id).id(point.id).disabled(!model.canEdit)
                 } else {
-                    Text("选中一个点击点后，在这里调整坐标、次数与等待时间。")
+                    Text("步骤设置").font(.headline)
+                    Text("选中一个步骤以调整坐标、次数和间隔。")
                         .font(.caption).foregroundStyle(.secondary).lineSpacing(4).frame(minHeight: 190, alignment: .topLeading)
                 }
                 Divider()
@@ -276,20 +306,20 @@ struct MainView: View {
                             .disabled(model.plan.repeatForever)
                     }
                     launchSettings
-                    Text("每一轮会按左侧顺序执行所有已启用的点。").font(.system(size: 10)).foregroundStyle(.secondary)
+                    Text("每轮依次执行所有已启用的步骤。").font(.system(size: 10)).foregroundStyle(.secondary)
                 }.textFieldStyle(.roundedBorder).disabled(!model.canEdit)
                 Divider()
                 VStack(alignment: .leading, spacing: 10) {
                     HStack {
                         Image(systemName: model.accessibility && model.eventAccess ? "checkmark.circle.fill" : "lock.circle")
                             .foregroundStyle(model.accessibility && model.eventAccess ? Color.teal : Color.orange)
-                        Text(model.accessibility && model.eventAccess ? "点击权限已就绪" : "需要辅助功能权限").font(.caption.weight(.medium))
+                        Text(model.accessibility && model.eventAccess ? "操作权限已就绪" : "需要辅助功能权限").font(.caption.weight(.medium))
                     }
                     if !model.accessibility || !model.eventAccess {
                         Button("开启辅助功能权限") { model.requestAccess() }.disabled(!model.canEdit)
                         Text("授权后若仍未就绪，退出并重新打开应用。").font(.system(size: 10)).foregroundStyle(.secondary)
                     }
-                    Text("后台点击是实验功能，实际效果取决于目标软件。不会自动改成前台点击。")
+                    Text("后台模式是否有效，取决于目标软件是否接受这些操作。")
                         .font(.system(size: 10)).foregroundStyle(.secondary).lineSpacing(3)
                 }
             }.padding(18)
@@ -337,31 +367,81 @@ struct MainView: View {
     }
 }
 
-private struct PointRow: View {
+struct PointRow: View {
     @ObservedObject var model: WorkspaceModel
     @ObservedObject var engine: RunEngine
     let point: ClickPoint
     let index: Int
+    @Binding var drag: StepListDrag?
+    let canReorder: Bool
+    let createGroup: (() -> Void)?
+    let endDrag: (CGPoint) -> Void
+
     var body: some View {
-        HStack(spacing: 10) {
-            Text(String(index + 1)).font(.system(size: 11, weight: .semibold, design: .monospaced))
-                .frame(width: 23, height: 23).background(.primary.opacity(0.05), in: Circle())
+        HStack(spacing: 6) {
+            reorderHandle
             Toggle("启用 \(point.name)", isOn: Binding(get: { model.plan.points.first { $0.id == point.id }?.enabled ?? false }, set: { value in
                 if let i = model.plan.points.firstIndex(where: { $0.id == point.id }) { model.plan.points[i].enabled = value }
             })).labelsHidden().toggleStyle(.checkbox).disabled(!model.canEdit)
             VStack(alignment: .leading, spacing: 3) {
-                Text(point.name.isEmpty ? "点击点 \(index + 1)" : point.name).font(.system(size: 12, weight: .medium))
-                Text("(\(point.x.formatted(.number.precision(.fractionLength(0...1)))), \(point.y.formatted(.number.precision(.fractionLength(0...1)))))")
-                    .font(.system(size: 10, design: .monospaced)).foregroundStyle(.secondary)
+                HStack(spacing: 4) {
+                    if point.drag != nil { Image(systemName: "arrow.right").foregroundStyle(.tint) }
+                    Text(point.displayName(at: index)).lineLimit(1)
+                }.font(.system(size: 12, weight: .medium))
+                Text(point.drag.map { coordinateText(point.position) + " → " + coordinateText($0.end) } ?? coordinateText(point.position))
+                    .font(.system(size: 10, design: .monospaced)).foregroundStyle(.secondary).lineLimit(1)
             }
             Spacer(minLength: 3)
             Text("\(point.count) 次").font(.caption.monospacedDigit()).foregroundStyle(.secondary)
             Text("\(point.interval.formatted(.number.precision(.fractionLength(0...2))))s").font(.caption.monospacedDigit()).foregroundStyle(.secondary).frame(width: 42, alignment: .trailing)
             if engine.currentPoint == point.id && engine.state.busy { Image(systemName: "play.fill").foregroundStyle(.tint).font(.caption) }
-        }.padding(.horizontal, 10).padding(.vertical, 9).contentShape(Rectangle())
+            Menu {
+                stepActions
+            } label: {
+                Image(systemName: "ellipsis").frame(width: 20, height: 20)
+            }
+            .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
+            .help("步骤操作")
+            .accessibilityLabel("第 \(index + 1) 步操作")
+            .disabled(!model.canEdit)
+        }.padding(.horizontal, 8).padding(.vertical, 9).contentShape(Rectangle())
             .background(model.selectedPoint == point.id ? Color.accentColor.opacity(0.1) : .clear, in: RoundedRectangle(cornerRadius: 6))
             .opacity(point.enabled ? 1 : 0.5)
             .onTapGesture { model.selectedPoint = point.id }
+            .contextMenu { stepActions }
+    }
+
+    @ViewBuilder private var reorderHandle: some View {
+        StepSortHandle(model: model, id: point.id, label: "拖拽排序第 \(index + 1) 步",
+                       enabled: canReorder, drag: $drag, endDrag: endDrag) {
+            Text(String(index + 1)).font(.system(size: 11, weight: .semibold, design: .monospaced))
+                .padding(.horizontal, 4).frame(minWidth: 21, minHeight: 23)
+                .background(.primary.opacity(0.05), in: Capsule())
+        }
+    }
+
+    @ViewBuilder private var stepActions: some View {
+        if let createGroup {
+            Button("创建循环组…", systemImage: "repeat", action: createGroup).disabled(!model.canEdit)
+            Divider()
+        }
+        StepCopyActions(model: model, id: point.id)
+    }
+
+    private func coordinateText(_ position: CGPoint) -> String {
+        let format = FloatingPointFormatStyle<Double>.number.precision(.fractionLength(0...1))
+        return "(\(Double(position.x).formatted(format)), \(Double(position.y).formatted(format)))"
+    }
+}
+
+private struct StepCopyActions: View {
+    @ObservedObject var model: WorkspaceModel
+    let id: UUID
+    var body: some View {
+        Group {
+            Button("复制到本条下方") { model.duplicate([id], placement: .belowEach) }
+            Button("复制到列表底部") { model.duplicate([id], placement: .bottom) }
+        }.disabled(!model.canEdit || model.plan.points.count >= ClickPlan.maximumSteps)
     }
 }
 
@@ -370,26 +450,66 @@ private struct PointInspector: View {
     let id: UUID
     private var point: Binding<ClickPoint> {
         Binding(get: { model.plan.points.first { $0.id == id } ?? ClickPoint(id: id) }, set: { value in
-            if let index = model.plan.points.firstIndex(where: { $0.id == id }) { model.plan.points[index] = value }
+            if model.canEdit, let index = model.plan.points.firstIndex(where: { $0.id == id }) { model.plan.points[index] = value }
         })
     }
+    private var drag: Binding<DragMotion> {
+        Binding(get: { point.wrappedValue.drag ?? DragMotion(end: .zero) }, set: { point.wrappedValue.drag = $0 })
+    }
+
     var body: some View {
+        let step = point.wrappedValue
         VStack(alignment: .leading, spacing: 13) {
-            TextField("点击点名称", text: point.name)
-            HStack(spacing: 10) {
-                VStack(alignment: .leading, spacing: 5) { Text("X 坐标").font(.caption).foregroundStyle(.secondary); TextField("X", value: point.x, format: .number) }
-                VStack(alignment: .leading, spacing: 5) { Text("Y 坐标").font(.caption).foregroundStyle(.secondary); TextField("Y", value: point.y, format: .number) }
+            TextField("\(step.kind)名称", text: point.name)
+            coordinateFields(step.drag == nil ? "" : "起点 ", x: point.x, y: point.y)
+            if let motion = step.drag {
+                coordinateFields("终点 ", x: drag.endX, y: drag.endY)
+                Text(displacement(from: step.position, to: motion.end)).font(.caption).foregroundStyle(.secondary)
+                secondsField("单次拖动耗时", value: drag.duration).help("0.1～10 秒")
             }
-            HStack { Text("点击次数").font(.caption); Spacer(); TextField("次数", value: point.count, format: .number).frame(width: 82) }
-            HStack { Text("每次点击后等待").font(.caption); Spacer(); TextField("秒", value: point.interval, format: .number.precision(.fractionLength(0...2))).frame(width: 55); Text("秒").font(.caption).foregroundStyle(.secondary) }
+            HStack { Text(step.drag == nil ? "点击次数" : "拖动次数").font(.caption); Spacer(); TextField("次数", value: point.count, format: .number).frame(width: 82) }
+            secondsField("每次执行后等待", value: point.interval)
             HStack(spacing: 8) {
-                Button { model.movePoint(id, by: -1) } label: { Image(systemName: "arrow.up") }.help("上移").accessibilityLabel("上移点击点")
-                Button { model.movePoint(id, by: 1) } label: { Image(systemName: "arrow.down") }.help("下移").accessibilityLabel("下移点击点")
-                Button { model.duplicate(id) } label: { Image(systemName: "doc.on.doc") }.help("复制").accessibilityLabel("复制点击点")
+                Menu {
+                    StepCopyActions(model: model, id: id)
+                } label: { Image(systemName: "doc.on.doc") }
+                    .fixedSize().help("复制步骤").accessibilityLabel("复制步骤")
                 Spacer()
-                Button(role: .destructive) { model.removePoint(id) } label: { Image(systemName: "trash") }.help("删除").accessibilityLabel("删除点击点")
+                Button(role: .destructive) { model.removePoint(id) } label: { Image(systemName: "trash") }.help("删除").accessibilityLabel("删除步骤")
             }
         }.textFieldStyle(.roundedBorder)
+    }
+
+    private func coordinateFields(_ prefix: String, x: Binding<Double>, y: Binding<Double>) -> some View {
+        HStack(spacing: 10) {
+            coordinateField(prefix + "X", value: x)
+            coordinateField(prefix + "Y", value: y)
+        }
+    }
+
+    private func coordinateField(_ label: String, value: Binding<Double>) -> some View {
+        VStack(alignment: .leading, spacing: 5) {
+            Text(label).font(.caption).foregroundStyle(.secondary)
+            TextField(label, value: value, format: .number)
+        }
+    }
+
+    private func secondsField(_ label: String, value: Binding<Double>) -> some View {
+        HStack {
+            Text(label).font(.caption)
+            Spacer()
+            TextField(label, value: value, format: .number.precision(.fractionLength(0...2))).frame(width: 66)
+            Text("秒").font(.caption).foregroundStyle(.secondary)
+        }
+    }
+
+    private func displacement(from start: CGPoint, to end: CGPoint) -> String {
+        let dx = Double(end.x - start.x), dy = Double(end.y - start.y)
+        let format = FloatingPointFormatStyle<Double>.number.precision(.fractionLength(0...2))
+        let horizontal = dx == 0 ? nil : "向\(dx > 0 ? "右" : "左") \(abs(dx).formatted(format)) 点"
+        let vertical = dy == 0 ? nil : "向\(dy > 0 ? "下" : "上") \(abs(dy).formatted(format)) 点"
+        let parts = [horizontal, vertical].compactMap { $0 }
+        return parts.isEmpty ? "起点和终点须分开" : parts.joined(separator: " · ")
     }
 }
 
@@ -403,7 +523,7 @@ private struct RunBar: View {
     }
     private var startTitle: String {
         switch model.plan.startMode {
-        case .immediate: return "开始点击"
+        case .immediate: return "开始运行"
         case .countdown: return "开始倒计时"
         case .scheduled: return "预约启动"
         }
@@ -417,7 +537,7 @@ private struct RunBar: View {
             }.frame(width: 35, height: 35)
             VStack(alignment: .leading, spacing: 4) {
                 HStack(spacing: 10) {
-                    Text(engine.state.title).font(.system(size: 13, weight: .semibold))
+                    Text(engine.statusTitle).font(.system(size: 13, weight: .semibold))
                     if engine.state == .countdown || (engine.state == .paused && engine.countdown > 0) { Text(countdownText).font(.caption.monospacedDigit()).foregroundStyle(.secondary) }
                     Text("已发送 \(engine.sent)\(engine.total.map { " / \($0)" } ?? "") 次").font(.caption.monospacedDigit()).foregroundStyle(.secondary)
                 }
@@ -430,7 +550,7 @@ private struct RunBar: View {
                         Button(engine.scheduledDate == nil ? "停止" : "取消预约", systemImage: "stop.fill", role: .destructive) { engine.stop() }
                     } else {
                         Button(startTitle, systemImage: model.plan.startMode == .scheduled ? "clock" : "play.fill") { model.start() }.buttonStyle(.borderedProminent)
-                            .disabled(model.plan.activePoints.isEmpty || (model.plan.windowCoordinates && model.target == nil))
+                            .disabled(model.dragPlacement != nil || model.plan.activePoints.isEmpty || (model.plan.windowCoordinates && model.target == nil))
                     }
                 }.controlSize(.large)
                 Text(model.hotkeys.stopAvailable ? "⌃⌘Esc 全部停止 · ⌃⌘P 全部暂停 / 继续" : "停止快捷键被占用，请重新打开应用")

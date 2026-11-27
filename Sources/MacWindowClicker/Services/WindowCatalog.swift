@@ -82,6 +82,17 @@ enum WindowCatalog {
     }
     static var desktopFrame: CGRect { displayFrames.reduce(CGRect.null) { $0.union($1) } }
 
+    static func isUnchangedDuringDrag(_ target: WindowTarget) -> Bool {
+        guard let app = NSRunningApplication(processIdentifier: target.pid), !app.isTerminated, !app.isHidden,
+              app.launchDate == target.launchDate, app.bundleIdentifier == target.bundleID,
+              let rows = CGWindowListCopyWindowInfo(.optionIncludingWindow, target.id) as? [[String: Any]],
+              let row = rows.first(where: { $0[kCGWindowNumber as String] as? UInt32 == target.id }),
+              row[kCGWindowOwnerPID as String] as? Int32 == target.pid,
+              row[kCGWindowIsOnscreen as String] as? Bool == true,
+              let dict = row[kCGWindowBounds as String] as? [String: Any] else { return false }
+        return CGRect(dictionaryRepresentation: dict as CFDictionary) == target.frame
+    }
+
     static func isUnobstructed(_ target: WindowTarget, at point: CGPoint) -> Bool {
         guard let rows = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] else { return false }
         for row in rows {

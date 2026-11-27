@@ -99,6 +99,98 @@ final class ClickerCoreTests: XCTestCase {
         XCTAssertNil(plan.totalClicks)
         plan.points.forEach { XCTAssertEqual($0.interval, 0.5) }
     }
+
+    func testMixedPlanRoundTripsWithoutTurningLegacyClicksIntoDrags() throws {
+        var plan = ClickPlan()
+        let click = ClickPoint(name: "点击", x: 40, y: 60, count: 2)
+        plan.points = [click]
+        let legacyData = try JSONEncoder().encode(plan)
+        let legacy = try JSONDecoder().decode(ClickPlan.self, from: legacyData)
+        XCTAssertEqual(legacy.version, 1)
+        XCTAssertNil(legacy.points.first?.drag)
+
+        let end = CGPoint(x: 20, y: 100)
+        let swipe = ClickPoint(name: "拖动", x: 120, y: 40, count: 3, drag: DragMotion(end: end, duration: 0.3))
+        plan.points.append(swipe)
+        XCTAssertEqual(plan.version, 2)
+        XCTAssertEqual(plan.totalClicks, 5)
+        let restored = try JSONDecoder().decode(ClickPlan.self, from: JSONEncoder().encode(plan))
+        try restored.validateForRun()
+        XCTAssertEqual(restored.points, [click, swipe])
+        XCTAssertEqual(DragMotion.position(from: swipe.position, to: end, fraction: 0.5), CGPoint(x: 70, y: 70))
+        XCTAssertEqual(DragMotion.position(from: swipe.position, to: end, fraction: 1), end)
+        plan.points.removeLast()
+        XCTAssertEqual(plan.version, 1)
+    }
+
+    func testCopyingCheckedStepsPreservesOrderParametersAndNewIdentifiers() {
+        let click = ClickPoint(name: "点击", x: 20, y: 90, count: 3, interval: 0.25)
+        let unchecked = ClickPoint(name: "跳过", enabled: false)
+        let drag = ClickPoint(name: "拖动", x: 40, y: 60, drag: DragMotion(end: CGPoint(x: 80, y: 90), duration: 0.8))
+        let ids: Set<UUID> = [drag.id, click.id]
+        var plan = ClickPlan()
+        plan.points = [click, unchecked, drag]
+        var below = plan
+        XCTAssertNotNil(below.duplicateSteps(ids, placement: .belowEach))
+        XCTAssertEqual(below.points.map(\.name), ["点击", "点击 副本", "跳过", "拖动", "拖动 副本"])
+
+        XCTAssertNotNil(plan.duplicateSteps(ids, placement: .bottom))
+        XCTAssertEqual(plan.points.map(\.name), ["点击", "跳过", "拖动", "点击 副本", "拖动 副本"])
+        XCTAssertEqual(Set(plan.points.map(\.id)).count, plan.points.count)
+        for (original, copy) in zip([click, drag], plan.points.suffix(2)) {
+            var restored = copy
+            restored.id = original.id
+            restored.name = original.name
+            XCTAssertEqual(restored, original)
+        }
+    }
+
+    func testBatchCopyRejectsOverflowWithoutPartiallyCopying() {
+        var plan = ClickPlan()
+        plan.points = (0..<(ClickPlan.maximumSteps - 1)).map { ClickPoint(x: Double($0)) }
+        let original = plan
+        XCTAssertNil(plan.duplicateSteps(Set(plan.points.prefix(2).map(\.id)), placement: .bottom))
+        XCTAssertEqual(plan, original)
+    }
+
+    func testMovingStepsBeforeAndAfterOtherRows() {
+        let first = ClickPoint(name: "A"), second = ClickPoint(name: "B"), third = ClickPoint(name: "C", enabled: false)
+        var plan = ClickPlan()
+        plan.points = [first, second, third]
+        XCTAssertTrue(plan.moveStep(first.id, relativeTo: third.id, placement: .after))
+        XCTAssertEqual(plan.points, [second, third, first])
+        XCTAssertTrue(plan.moveStep(first.id, relativeTo: second.id, placement: .before))
+        XCTAssertEqual(plan.points, [first, second, third])
+        XCTAssertFalse(plan.moveStep(second.id, relativeTo: first.id, placement: .after))
+        XCTAssertFalse(plan.moveStep(second.id, relativeTo: second.id, placement: .after))
+        XCTAssertFalse(plan.moveStep(first.id, relativeTo: UUID(), placement: .before))
+        XCTAssertEqual(plan.points, [first, second, third])
+    }
+
+    func testInvalidDragDurationAndEndpointsFailValidation() throws {
+        var plan = ClickPlan()
+        plan.points = [ClickPoint(x: 40, y: 60, drag: DragMotion(end: CGPoint(x: 120, y: 70)))]
+        try plan.validateForRun()
+        plan.points[0].drag?.duration = .nan
+        XCTAssertThrowsError(try plan.validate())
+        plan.points[0].drag?.duration = 0.01
+        XCTAssertThrowsError(try plan.validate())
+        plan.points[0].drag?.duration = 0.5
+        plan.points[0].drag?.endX = .infinity
+        XCTAssertThrowsError(try plan.validate())
+        plan.points[0].drag = DragMotion(end: plan.points[0].position)
+        XCTAssertThrowsError(try plan.validate())
+    }
+
+    func testDragMustStayOnDisplaysAlongTheEntirePath() {
+        let left = CGRect(x: -100, y: 0, width: 100, height: 100)
+        let right = CGRect(x: 0, y: 0, width: 100, height: 100)
+        let start = CGPoint(x: 50, y: 20), end = CGPoint(x: -50, y: 80)
+        XCTAssertTrue(Coordinates.dragIsOnDisplays(from: start, to: end, displays: [left, right]))
+        XCTAssertFalse(Coordinates.dragIsOnDisplays(from: start, to: end, displays: [left.offsetBy(dx: -1, dy: 0), right]))
+        XCTAssertFalse(Coordinates.dragIsOnDisplays(from: start, to: CGPoint(x: -101, y: 80), displays: [left, right]))
+        XCTAssertTrue(Coordinates.dragIsOnDisplays(from: start, to: CGPoint(x: 90, y: 20), displays: [right]))
+    }
     func testInvalidImportedPlansAreRejected() {
         var plan = ClickPlan()
         XCTAssertThrowsError(try plan.validateForRun())
